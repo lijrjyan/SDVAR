@@ -140,9 +140,8 @@ class VAR(nn.Module):
             return all_logits[:, :prefix_len], all_logits[:, prefix_len:]
         return all_logits
 
-    # '''
     @torch.no_grad()
-    def autoregressive_infer_cfg(
+    def autoregressive_infer_cfg1(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
         more_smooth=False,
@@ -186,7 +185,9 @@ class VAR(nn.Module):
             # last_L = cur_L
             cur_L += pn*pn
             # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            # 默认为false，恒等变化
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            
             x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
@@ -212,9 +213,8 @@ class VAR(nn.Module):
         
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
-    # '''
 
-    '''
+    # '''
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
@@ -249,90 +249,61 @@ class VAR(nn.Module):
         # 这个 张量的shape是(2B,)
         # 首先进行由生成带有embeding信息的sos (2B,C)
 
-        # 然后让unsqueezec插入新维度1 (2B,1,C)
-        # 最后复制（实际上是广播） B份 (B,1,C)
+        # 然后让unsqueezec向sos中插入新维度1 (2B, 1, C)
+        # pos_start (1,1,C) 广播 2B份 (2B, 1, C)
+        # 操作完的两个张亮相加
+        # 最后复制（实际上是广播） B份 (2B,1,C)
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        
-        first_input_token_map = 
 
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
-        # 这两个内容最开始都应该为空
-        input_token_map = []
-        next_token_map = []
-        
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
 
             # 如果是第一层，生成first_token_map,否则input_token_map = next_token_map
+            # 第一层因为设计 embeding后加参数，而不是加参数后embeding,导致第一层无法实现加入token_hub
+            # 也就是说无论怎么样都没有办法实现两个模型之间的统一
             if si == 0:
-                # 为了保证代码的一致性，所以我们最开始不生成2 * B 也不加位置编码
-                input_token_map =  (
-                    sos.unsqueeze(1).expand(B, self.first_l, -1) 
-                    + self.pos_start.expand(B, self.first_l, -1) 
-                    # + lvl_pos[:, :self.first_l]
+                input_token_map = (
+                    sos.unsqueeze(1).expand(2 * B, self.first_l, -1) 
+                    + self.pos_start.expand(2 * B, self.first_l, -1) 
+                    + lvl_pos[:, :self.first_l]
                 )
             else: 
                 input_token_map = next_token_map
-                input_token_map = input_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-
-            if si != self.num_stages_minus_1:   # prepare for next stage
-                next_pn = self.patch_nums[si+1]
-                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1,2)
-                draft_token_hub.append(draft_next_token_map)
-                draft_next_token_map = (
-                    self.draft_model.word_embed(draft_next_token_map)
-                    + draft_lvl_pos[:, draft_cur_L : draft_cur_L + next_pn*next_pn]
-                )
-                draft_next_token_map = draft_next_token_map.repeat(2,1,1)
-
-
-            # 推测解码的时候现在就可以将token_add进去了
-
-                # next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                input_token_map.view(B, self.Cvae, -1).transpose(1,2)
+                input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
+                input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
-            # 完成输入后我们统一进行输入token的处理
-            if si != self.num_stages_minus_1:   # prepare for next stage
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-    
-
-
-            
-            ratio = si / self.num_stages_minus_1
-            # last_L = cur_L
-            cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            cur_L = cur_L + pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            x = next_token_map
-            AdaLNSelfAttn.forward
-            for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD)
+            
+            x = input_token_map
+
+            for block in self.blocks:
+                x = block(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
+            logits = self.get_logits(x, cond_BD)
             
             t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+            logits = (1+t) * logits[:B] - t * logits[B:]
             
-            idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            token_id = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+
             if not more_smooth: # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)   # B, l, Cvae
+                h_BChw = self.vae_quant_proxy[0].embedding(token_id)
             else:   # not used when evaluating FID/IS/Precision/Recall
                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                h_BChw = gumbel_softmax_with_rng(logits.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            if si != self.num_stages_minus_1:   # prepare for next stage
-                next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-        
-        for b in self.blocks: b.attn.kv_caching(False)
+
+        for block in self.blocks: block.attn.kv_caching(False)
+
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
-    '''
+    # '''
     
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
