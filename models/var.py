@@ -312,6 +312,7 @@ class VAR(nn.Module):
     def extra_repr(self):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
+    '''
     @torch.no_grad()
     def autoregressive_infer_cfg_sd_helper(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
@@ -401,7 +402,7 @@ class VAR(nn.Module):
         for block in self.blocks: block.attn.kv_caching(False)
 
         return input_token_history, f_hat_history, logits_history, token_id_history, next_token_map, f_hat
-        
+    ''' 
 class VARHF(VAR, PyTorchModelHubMixin):
             # repo_url="https://github.com/FoundationVision/VAR",
             # tags=["image-generation"]):
@@ -622,6 +623,8 @@ class SDVAR(nn.Module):
         target_sos, target_cond_BD, target_cond_BD_or_gss, \
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
 
+        target_f_hat = draft_f_hat
+
         target_cur_L = 0
         target_f_hat = draft_f_hat
 
@@ -735,6 +738,7 @@ class SDVAR(nn.Module):
                     
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
 
+'''
    @torch.no_grad()
     def autoregressive_infer_cfg_sd(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
@@ -836,3 +840,4 @@ class SDVAR(nn.Module):
                     break
 
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+'''
