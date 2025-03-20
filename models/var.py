@@ -461,6 +461,15 @@ class SDVAR(nn.Module):
         
         self.attn_bias_for_sdmasking = attn_bias_for_sdmasking
 
+        blockmasking = torch.full((total_tokens, total_tokens), float('-inf'))  # 默认禁止注意力
+        for i in range(total_tokens):
+            for j in range(total_tokens):
+                if block_ids[i] == block_ids[j]:  # 只允许相同 block_id 之间互相注意
+                    blockmasking[i, j] = 0.0
+
+        blockmasking = blockmasking.reshape(1, 1, total_tokens, total_tokens)
+        self.attn_bias_for_block = blockmasking
+
     def init_param(
             self,
             model: VAR,
