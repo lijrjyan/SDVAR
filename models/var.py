@@ -264,6 +264,7 @@ class VAR(nn.Module):
 
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
+            print(f"{si}")
 
             # 如果是第一层，生成first_token_map,否则input_token_map = next_token_map
             # 第一层因为设计 embeding后加参数，而不是加参数后embeding,导致第一层无法实现加入token_hub
