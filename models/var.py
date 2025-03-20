@@ -259,6 +259,9 @@ class VAR(nn.Module):
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
+        next_token_map = torch.zeros((2 * B, self.first_l, self.embedding_dim), device=device)
+        input_token_map = torch.zeros((2 * B, self.first_l, self.embedding_dim), device=device)
+
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
 
@@ -277,8 +280,8 @@ class VAR(nn.Module):
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
-            cur_L = cur_L + pn * pn
             ratio = si / self.num_stages_minus_1
+            cur_L = cur_L + pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             
             x = input_token_map
