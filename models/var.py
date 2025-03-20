@@ -182,7 +182,7 @@ class VAR(nn.Module):
                 )
             else: 
                 input_token_map = next_token_map
-                input_token_map.view(B, self.Cvae, -1).transpose(1,2)
+                input_token_map = input_token_map.view(B, self.Cvae, -1).transpose(1,2)
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
