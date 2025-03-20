@@ -241,18 +241,16 @@ class VAR(nn.Module):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
             
         # label_B的形状是(B,)
-        
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
-        
         # 拆解一下first token map的来头
         # 其中 torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0)
         # 这个 张量的shape是(2B,)
         # 首先进行由生成带有embeding信息的sos (2B,C)
-
         # 然后让unsqueezec向sos中插入新维度1 (2B, 1, C)
         # pos_start (1,1,C) 广播 2B份 (2B, 1, C)
         # 操作完的两个张亮相加
         # 最后复制（实际上是广播） B份 (2B,1,C)
+
+        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
 
@@ -277,14 +275,13 @@ class VAR(nn.Module):
                 )
             else: 
                 input_token_map = next_token_map
-                input_token_map.view(B, self.Cvae, -1).transpose(1,2)
+                input_token_map = input_token_map.view(B, self.Cvae, -1).transpose(1,2)
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
             ratio = si / self.num_stages_minus_1
             cur_L = cur_L + pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            
             x = input_token_map
 
             for block in self.blocks:
