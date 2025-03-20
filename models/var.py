@@ -278,6 +278,7 @@ class VAR(nn.Module):
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
             cur_L = cur_L + pn * pn
+            ratio = si / self.num_stages_minus_1
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             
             x = input_token_map
