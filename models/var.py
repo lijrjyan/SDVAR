@@ -169,6 +169,8 @@ class VAR(nn.Module):
         sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
         first_token = torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0)
 
+
+        print(f"label_B: {label_B.shape}")
         print(f"sos.shape: {sos.shape}")
         print(f"first_token.shape {first_token.shape}" )
         
@@ -245,8 +247,9 @@ class VAR(nn.Module):
         # 拆解一下first token map的来头
         # 其中 torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0)
         # 这个 张量的shape是(2B,)
-        # 首先进行由sos生成带有embeding信息的内容(C)
-        # 然后让unsqueezec插入新维度1 (C,1)
+        # 首先进行由生成带有embeding信息的sos (2B,C)
+
+        # 然后让unsqueezec插入新维度1 (2B,1,C)
         # 最后复制（实际上是广播） B份 (B,1,C)
         
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
