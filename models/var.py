@@ -259,8 +259,8 @@ class VAR(nn.Module):
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
 
-        next_token_map = torch.zeros((2 * B, self.first_l, self.embedding_dim), device=device)
-        input_token_map = torch.zeros((2 * B, self.first_l, self.embedding_dim), device=device)
+        next_token_map = torch.zeros((2 * B, self.first_l, self.C), device=device)
+        input_token_map = torch.zeros((2 * B, self.first_l, self.C), device=device)
 
         for b in self.blocks: b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
