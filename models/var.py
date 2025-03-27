@@ -384,14 +384,14 @@ class VAR(nn.Module):
                 input_token_map = input_token_map.view(B, self.Cvae, -1).transpose(1,2)
                 # 我们会保存从输入开始的input_token_map到最后
                 input_token_history.append(input_token_map)
-                print(f"si {si}, input_token_map.shape: {input_token_map.shape}")
+                # print(f"si {si}, input_token_map.shape: {input_token_map.shape}")
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
 
             ratio = si / self.num_stages_minus_1
             cur_L = cur_L + pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            print(f"{si}")           
+            # print(f"{si}")           
 
             # 我们会保存从输入的f_hat开始到最后
             f_hat_history.append(f_hat)
@@ -443,7 +443,7 @@ class VAR(nn.Module):
     # ''' 
 
 
-    '''
+    # '''
     # helper2是给予draft_model生成的一长串target_model进行一次性验证
     # 首先一定需要给的参数是current step表示当前生成的步数， draft_step表示需要生成的内容，
     @torch.no_grad()
@@ -457,10 +457,10 @@ class VAR(nn.Module):
         sos,
         lvl_pos,
         attn_bias,
+        sindex,
+        pindex,
 
-        cfg=1.5, top_k=0, top_p=0.0,
-        more_smooth=False,
-        
+        cfg=1.5, top_k=0, top_p=0.0,more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
 
         rng = rng
@@ -516,7 +516,7 @@ class VAR(nn.Module):
         # logits_history: current_step -> current_step + step - 1, len = step
         # token_id_history: current_step -> current_step + step - 1, len = step
         return input_token_history, f_hat_history, logits_history, token_id_history
-    ''' 
+    # ''' 
 
 class VARHF(VAR, PyTorchModelHubMixin):
             # repo_url="https://github.com/FoundationVision/VAR",
@@ -875,7 +875,7 @@ class SDVAR(nn.Module):
     def autoregressive_infer_cfg_sd(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
         g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
-        more_smooth=False, warmup_step = 3, draft_step = 3, similarity_thresh = 0.2, k = 2
+        more_smooth=False, warmup_step = 3, draft_step = 3, similarity_thresh = 0.2, k = 2, sd_mask = 5
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -926,70 +926,105 @@ class SDVAR(nn.Module):
         # current_step表示的是已经接受到current_step - 1
         # current_step本身还没有进行预测
         current_step = 0
-        # input_token_history, f_hat_history, _, _ = self.target_model.autoregressive_infer_cfg_sd_helper1(
-        #     current_step,
-        #     warmup_step, 
-        #     next_token_map, 
-        #     f_hat, 
-        #     self.rng, 
-        #     target_sos, 
-        #     target_lvl_pos,
-        #     cfg, 
-        #     top_k,
-        #     top_p,
-        #     more_smooth
-        # ) 
-        input_token_history, f_hat_history, logits_history, token_id_history = self.target_model.autoregressive_infer_cfg_sd_helper1(
-            B = B,
-            current_step = current_step,
-            step = warmup_step, 
-            next_token_map = next_token_map, 
-            f_hat = f_hat, 
-            rng = self.rng, 
-            sos = target_sos, 
-            lvl_pos = target_lvl_pos,
-            cfg = cfg, 
-            top_k = top_k,
-            top_p = top_p,
-            more_smooth = more_smooth
+        input_token_history, f_hat_history, _, _ = self.target_model.autoregressive_infer_cfg_sd_helper1(
+            current_step,
+            warmup_step, 
+            next_token_map, 
+            f_hat, 
+            self.rng, 
+            target_sos, 
+            target_lvl_pos,
+            cfg, 
+            top_k,
+            top_p,
+            more_smooth
         ) 
         # print(f"input_token_history.shape: {input_token_history.shape}")
         # print(f"f_hat_history.shape: {f_hat_history.shape}" )
-        print(f"logits_history[1].shape: {logits_history[1].shape}")
-        print(f"token_id_history[1].shape: {token_id_history[1].shape}" )
+        # print(f"logits_history[1].shape: {logits_history[1].shape}")
+        # print(f"token_id_history[1].shape: {token_id_history[1].shape}" )
+
+        # logits_history[1].shape: torch.Size([8, 4, 4096])
+        # 2B, pn * pn, voc
+        # token_id_history[1].shape: torch.Size([8, 4])
+
         current_step = current_step + warmup_step
         
         next_token_map = input_token_history[-1]
         f_hat = f_hat_history[-1]
 
+
+
+        start_points = [0,1,5,14,30,55,91,155,255,424]
+        exit_points = [1,5,14,30,55,91,155,255,424,680]
+        device = torch.device("cuda:0")
+
         # 循环每一步是进行当前步的预测
         # 表示的是从current_step-1的已经确认的信息，开始预测从current_step到total step 
         # 每次iteration结束后current_step表示的是current_step已经完成了预测
-        # while current_step < total_steps:
-
-        #     draft_input_token_history, draft_f_hat_history, draft_logits_history, draft_token_id_history, draft_token_id_history, next_token_map, f_hat = \
-        #         self.draft_model.autoregressive_infer_cfg_sd_helper1(
-        #         current_step,
-        #         draft_step, 
-        #         next_token_map, 
-        #         f_hat, 
-        #         self.rng, 
-        #         draft_sos, 
-        #         draft_lvl_pos,
-        #         cfg, 
-        #         top_k,
-        #         top_p,
-        #         more_smooth
-        #     ) 
+        while current_step < total_steps:
             
-        #     draft_unified_next_token_map = torch.cat(draft_input_token_history, dim = 1)
+            # draft_step = min
 
-        #     target_unified_token_id, target_unified_logits = \
-        #         self.target_model.autoregressive_infer_cfg_sd_helper2(
-        #             current_step, 
-        #             draft_step, 
-        #             unified_next_token_map, 
-        #             attn_bias)
+            draft_input_token_history, draft_f_hat_history, draft_logits_history, draft_token_id_history, draft_token_id_history, next_token_map, f_hat = \
+                self.draft_model.autoregressive_infer_cfg_sd_helper1(
+                current_step,
+                draft_step, 
+                next_token_map, 
+                f_hat, 
+                self.rng, 
+                draft_sos, 
+                draft_lvl_pos,
+                cfg, 
+                top_k,
+                top_p,
+                more_smooth
+            ) 
+            
+            draft_unified_next_token_map = torch.cat(draft_input_token_history, dim = 1)
+
+            # 这里需要改pindex和sindex
+            sindex = start_points[current_step]
+            pindex = exit_points[current_step + draft_step]
+            # if sd_mask != 0:
+            #     if sd_mask == 1:
+            #         # sd_mask = 1, 全部层包括未预测这层进行block-wise的掩码
+            #         attn_bias = self.attn_bias_for_sdmasking[:,:,0:pindex,0:pindex]
+            #         attn_bias = attn_bias.to(device)
+            #     elif sd_mask == 2:
+            #         # sd_mask = 2, 全部层不包括未预测这层进行block-wise的掩码
+            #         attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
+            #         attn_bias[:, :, sindex:pindex, :] = 0.0
+            #         attn_bias = attn_bias.to(device)
+            #     elif sd_mask == 3:
+            #         # sd_mask = 3, 进行因果掩码
+            #         attn_bias = self.target_model.attn_bias_for_masking[:,:,0:pindex,0:pindex]
+            #     elif sd_mask == 4: 
+            #         # sd_mask = 1, 全部层包括未预测这层进行block-wise的掩码
+            #         attn_bias = self.attn_bias_for_block[:,:,0:pindex,0:pindex]
+            #         attn_bias = attn_bias.to(device)
+            #     elif sd_mask == 5:
+                    # sd_mask = 1, 全部层包括未预测这层进行block-wise的掩码
+            if sd_mask == 5:
+                attn_bias = self.attn_bias_for_block[:, :, sindex:pindex, sindex:pindex].clone()
+                attn_bias = attn_bias.to(device)
+
+
+            target_unified_token_id, target_unified_logits = \
+                self.target_model.autoregressive_infer_cfg_sd_helper2(
+                    B = B,
+                    current_step = current_step, 
+                    step = draft_step, 
+                    unified_next_token_map = draft_unified_next_token_map,  
+                    f_hat = f_hat, 
+                    rng = self.rng, 
+                    sos = target_sos,
+                    lvl_pos = target_lvl_pos,
+                    sindex = sindex,
+                    pindex = pindex, 
+                    attn_bias = attn_bias,
+                    cfg = cfg, top_k = top_k, top_p = top_p, more_smooth = more_smooth
+                )
             
         #     accept_step = 0
         #     cur_L = 0
@@ -1035,4 +1070,4 @@ class SDVAR(nn.Module):
         #             break
 
         # return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
-# '''
+'''
