@@ -381,7 +381,7 @@ class VAR(nn.Module):
             # 加上位置编码
             else: 
                 input_token_map = next_token_map
-                input_token_map.view(B, self.Cvae, -1).transpose(1,2)
+                input_token_map = input_token_map.view(B, self.Cvae, -1).transpose(1,2)
                 # 我们会保存从输入开始的input_token_map到最后
                 input_token_history.append(input_token_map)
                 print(f"si {si}, input_token_map.shape: {input_token_map.shape}")
@@ -400,10 +400,6 @@ class VAR(nn.Module):
             # 他没有保存current_step + step - 1的output, 这两个是最后的返回值
 
             x = input_token_map
-            
-
-
-
 
             for block in self.blocks:
                 x = block(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
@@ -924,9 +920,9 @@ class SDVAR(nn.Module):
         target_sos = target_cond_BD = self.target_model.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.target_model.num_classes)), dim=0))
         
         f_hat = target_sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        next_token_map = None
-
-
+        # next_token_map = None
+        next_token_map = torch.zeros((2 * B, self.target_model.first_l, self.target_model.C))
+        input_token_map = torch.zeros((2 * B, self.target_model.first_l, self.target_model.C))
         # current_step表示的是已经接受到current_step - 1
         # current_step本身还没有进行预测
         current_step = 0
