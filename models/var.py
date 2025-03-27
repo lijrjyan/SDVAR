@@ -953,10 +953,10 @@ class SDVAR(nn.Module):
             top_p = top_p,
             more_smooth = more_smooth
         ) 
-        print(f"input_token_history.shape: {input_token_history.shape}")
-        print(f"f_hat_history.shape: {f_hat_history.shape}" )
-        print(f"logits_history.shape: {logits_history.shape}")
-        print(f"token_id_history.shape: {token_id_history.shape}" )
+        # print(f"input_token_history.shape: {input_token_history.shape}")
+        # print(f"f_hat_history.shape: {f_hat_history.shape}" )
+        print(f"logits_history[1].shape: {logits_history[1].shape}")
+        print(f"token_id_history[1].shape: {token_id_history[1].shape}" )
         current_step = current_step + warmup_step
         
         next_token_map = input_token_history[-1]
