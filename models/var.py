@@ -940,6 +940,7 @@ class SDVAR(nn.Module):
         #     more_smooth
         # ) 
         input_token_history, f_hat_history, logits_history, token_id_history = self.target_model.autoregressive_infer_cfg_sd_helper1(
+            B = B,
             current_step = current_step,
             step = warmup_step, 
             next_token_map = next_token_map, 
