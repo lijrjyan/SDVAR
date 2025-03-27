@@ -960,18 +960,19 @@ class SDVAR(nn.Module):
 
             draft_input_token_history, draft_f_hat_history, draft_logits_history, draft_token_id_history, draft_token_id_history, next_token_map, f_hat = \
                 self.draft_model.autoregressive_infer_cfg_sd_helper1(
-                current_step,
-                draft_step, 
-                next_token_map, 
-                f_hat, 
-                self.rng, 
-                draft_sos, 
-                draft_lvl_pos,
-                cfg, 
-                top_k,
-                top_p,
-                more_smooth
-            ) 
+                    B = B,
+                    current_step = current_step,
+                    step = warmup_step, 
+                    next_token_map = next_token_map, 
+                    f_hat = f_hat, 
+                    rng = self.rng, 
+                    sos = target_sos, 
+                    lvl_pos = target_lvl_pos,
+                    cfg = cfg, 
+                    top_k = top_k,
+                    top_p = top_p,
+                    more_smooth = more_smooth,
+                ) 
             
             draft_unified_next_token_map = torch.cat(draft_input_token_history, dim = 1)
 
