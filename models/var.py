@@ -370,6 +370,7 @@ class VAR(nn.Module):
             ratio = si / self.num_stages_minus_1
             cur_L = cur_L + pn * pn
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            print(f"{si}")
 
             # 快进到current_step
             if si < current_step:
