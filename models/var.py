@@ -442,7 +442,7 @@ class VAR(nn.Module):
     # ''' 
 
 
-    # '''
+    '''
     # helper2是给予draft_model生成的一长串target_model进行一次性验证
     # 首先一定需要给的参数是current step表示当前生成的步数， draft_step表示需要生成的内容，
     @torch.no_grad()
@@ -455,6 +455,7 @@ class VAR(nn.Module):
         rng,
         sos,
         lvl_pos,
+        attn_bias,
 
         cfg=1.5, top_k=0, top_p=0.0,
         more_smooth=False,
@@ -477,69 +478,35 @@ class VAR(nn.Module):
         token_id_history = []
         input_token_history = []
         f_hat_history = []
+        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
         
         # input_token_map = torch.zeros((2 * B, self.first_l, self.C))
         
         for b in self.blocks: b.attn.kv_caching(True)
+        
+        input_token_map = unified_next_token_map
+        # 这里位置编码的编号要改，从current_step的到current_step + step(没有-1因为我们此时已经有current_step + step的预备内容了)
+        input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn] 
+        input_token_map.repeat(2,1,1)
+
+        x = input_token_map
+
+        for block in self.blocks:
+            x = block(x=x, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
+        logits = self.get_logits(x, cond_BD)
+        
+        # 这里需要改，要把t改成每组对应的t
+        t = cfg * ratio
+        logits = (1+t) * logits[:B] - t * logits[B:]
+        # # 我们会保存从输入的logits(融合后的)到最后
+        # logits_history.append(logits)
+        
+        # token_id = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+        # # 我们会保存从输入的token_id(融合后的)到最后
+        # token_id_history.append(token_id)
+
 
         # target model 会利用attn_bias一次性生成所有
-        for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-
-            ratio = si / self.num_stages_minus_1
-            cur_L = cur_L + pn * pn
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-
-            # 快进到current_step
-            if si < current_step:
-                continue
-            
-            # 实际上不会出现
-            if si == 0:
-                input_token_map = (
-                    sos.unsqueeze(1).expand(2 * B, self.first_l, -1) 
-                    + self.pos_start.expand(2 * B, self.first_l, -1) 
-                    + lvl_pos[:, :self.first_l]
-                )
-            # 将上一层内容进行处理转换为包含初始到上一层所有内容，与本层空内容的张量
-            # 加上位置编码
-            else: 
-                input_token_map = next_token_map
-                input_token_map.view(B, self.Cvae, -1).transpose(1,2)
-                # 我们会保存从输入开始的input_token_map到最后
-                input_token_history.append(input_token_map)
-                input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
-                input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-            
-            # 我们会保存从输入的f_hat开始到最后
-            f_hat_history.append(f_hat)
-            
-            # input_token_map_history, f_hat_history储存的内容是从current_step-> current_step + step - 1的input
-            # 他没有保存current_step + step - 1的output, 这两个是最后的返回值
-
-            x = input_token_map
-
-            for block in self.blocks:
-                x = block(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits = self.get_logits(x, cond_BD)
-            
-            t = cfg * ratio
-            logits = (1+t) * logits[:B] - t * logits[B:]
-            # 我们会保存从输入的logits(融合后的)到最后
-            logits_history.append(logits)
-            
-            token_id = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            # 我们会保存从输入的token_id(融合后的)到最后
-            token_id_history.append(token_id)
-
-            if not more_smooth: # this is the default case
-                h_BChw = self.vae_quant_proxy[0].embedding(token_id)
-            else:   # not used when evaluating FID/IS/Precision/Recall
-                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-                h_BChw = gumbel_softmax_with_rng(logits.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-            
-            h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-            f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-
         for block in self.blocks: block.attn.kv_caching(False)
 
         # return input_token_history, f_hat_history, logits_history, token_id_history, next_token_map, f_hat
@@ -548,7 +515,7 @@ class VAR(nn.Module):
         # logits_history: current_step -> current_step + step - 1, len = step
         # token_id_history: current_step -> current_step + step - 1, len = step
         return input_token_history, f_hat_history, logits_history, token_id_history
-    # ''' 
+    ''' 
 
 class VARHF(VAR, PyTorchModelHubMixin):
             # repo_url="https://github.com/FoundationVision/VAR",
@@ -958,7 +925,20 @@ class SDVAR(nn.Module):
         # current_step表示的是已经接受到current_step - 1
         # current_step本身还没有进行预测
         current_step = 0
-        input_token_history, f_hat_history, _, _ = self.target_model.autoregressive_infer_cfg_sd_helper1(
+        # input_token_history, f_hat_history, _, _ = self.target_model.autoregressive_infer_cfg_sd_helper1(
+        #     current_step,
+        #     warmup_step, 
+        #     next_token_map, 
+        #     f_hat, 
+        #     self.rng, 
+        #     target_sos, 
+        #     target_lvl_pos,
+        #     cfg, 
+        #     top_k,
+        #     top_p,
+        #     more_smooth
+        # ) 
+        input_token_history, f_hat_history, logits_history, token_id_history = self.target_model.autoregressive_infer_cfg_sd_helper1(
             current_step,
             warmup_step, 
             next_token_map, 
@@ -971,7 +951,10 @@ class SDVAR(nn.Module):
             top_p,
             more_smooth
         ) 
-
+        print(f"input_token_history.shape: {input_token_history.shape}")
+        print(f"f_hat_history.shape: {f_hat_history.shape}" )
+        print(f"logits_history.shape: {logits_history.shape}")
+        print(f"token_id_history.shape: {token_id_history.shape}" )
         current_step = current_step + warmup_step
         
         next_token_map = input_token_history[-1]
@@ -980,74 +963,74 @@ class SDVAR(nn.Module):
         # 循环每一步是进行当前步的预测
         # 表示的是从current_step-1的已经确认的信息，开始预测从current_step到total step 
         # 每次iteration结束后current_step表示的是current_step已经完成了预测
-        while current_step < total_steps:
+        # while current_step < total_steps:
 
-            draft_input_token_history, draft_f_hat_history, draft_logits_history, draft_token_id_history, draft_token_id_history, next_token_map, f_hat = \
-                self.draft_model.autoregressive_infer_cfg_sd_helper1(
-                current_step,
-                draft_step, 
-                next_token_map, 
-                f_hat, 
-                self.rng, 
-                draft_sos, 
-                draft_lvl_pos,
-                cfg, 
-                top_k,
-                top_p,
-                more_smooth
-            ) 
+        #     draft_input_token_history, draft_f_hat_history, draft_logits_history, draft_token_id_history, draft_token_id_history, next_token_map, f_hat = \
+        #         self.draft_model.autoregressive_infer_cfg_sd_helper1(
+        #         current_step,
+        #         draft_step, 
+        #         next_token_map, 
+        #         f_hat, 
+        #         self.rng, 
+        #         draft_sos, 
+        #         draft_lvl_pos,
+        #         cfg, 
+        #         top_k,
+        #         top_p,
+        #         more_smooth
+        #     ) 
             
-            draft_unified_next_token_map = torch.cat(draft_input_token_history, dim = 1)
+        #     draft_unified_next_token_map = torch.cat(draft_input_token_history, dim = 1)
 
-            target_unified_token_id, target_unified_logits = \
-                self.target_model.autoregressive_infer_cfg_sd_helper2(
-                    current_step, 
-                    draft_step, 
-                    unified_next_token_map, 
-                    attn_bias)
+        #     target_unified_token_id, target_unified_logits = \
+        #         self.target_model.autoregressive_infer_cfg_sd_helper2(
+        #             current_step, 
+        #             draft_step, 
+        #             unified_next_token_map, 
+        #             attn_bias)
             
-            accept_step = 0
-            cur_L = 0
-            for i in range(0,draft_step):
-                pn = self.patch_nums[current_step + i]
-                draft_tokens = draft_token_id_history[i]
-                cur_L += pn * pn
-                target_logits = target_unified_logits[:,cur_L-pn*pn:cur_L,:]
+        #     accept_step = 0
+        #     cur_L = 0
+        #     for i in range(0,draft_step):
+        #         pn = self.patch_nums[current_step + i]
+        #         draft_tokens = draft_token_id_history[i]
+        #         cur_L += pn * pn
+        #         target_logits = target_unified_logits[:,cur_L-pn*pn:cur_L,:]
                 
-                # 计算目标模型的概率分布
-                target_probs = torch.softmax(target_logits, dim=-1)  # 例如[8, 9, 4096]形状
+        #         # 计算目标模型的概率分布
+        #         target_probs = torch.softmax(target_logits, dim=-1)  # 例如[8, 9, 4096]形状
 
-                # 计算目标模型的概率分布
-                target_probs = torch.softmax(target_logits, dim=-1)  # (B, L, V)
+        #         # 计算目标模型的概率分布
+        #         target_probs = torch.softmax(target_logits, dim=-1)  # (B, L, V)
 
-                # 获取目标模型的 top-k 预测
-                topk_values, topk_indices = torch.topk(target_probs, k=k, dim=-1)  # (B, L, k)
+        #         # 获取目标模型的 top-k 预测
+        #         topk_values, topk_indices = torch.topk(target_probs, k=k, dim=-1)  # (B, L, k)
 
-                # 检查草稿 token 是否在 top-k 预测中
-                is_in_topk = (topk_indices == draft_tokens.unsqueeze(-1)).any(dim=-1)  # (B, L)
+        #         # 检查草稿 token 是否在 top-k 预测中
+        #         is_in_topk = (topk_indices == draft_tokens.unsqueeze(-1)).any(dim=-1)  # (B, L)
 
-                # 计算接受率
-                acceptance_rate = is_in_topk.float().mean().item()  # 计算平均接受率
+        #         # 计算接受率
+        #         acceptance_rate = is_in_topk.float().mean().item()  # 计算平均接受率
 
-                if acceptance_rate >= similarity_thresh:
-                    current_step += 1
-                else:
-                    f_hat = f_hat_history[i]
-                    token_id = target_unified_token_id[:,cur_L-pn*pn : cur_L]
-                    # 第i块draft_output没有通过检查,但是此时我们已经生成了第i块的target_output(即idx)，此时可以用这个idx生成next_token_map
-                    # 即用这个idx生成i+1块的input_token_map, 其中包括i块中所有内容和预处理信息
-                    # f_hat[i+1]中包含i块中所有信息，但是不包含i+1块中信息
+        #         if acceptance_rate >= similarity_thresh:
+        #             current_step += 1
+        #         else:
+        #             f_hat = f_hat_history[i]
+        #             token_id = target_unified_token_id[:,cur_L-pn*pn : cur_L]
+        #             # 第i块draft_output没有通过检查,但是此时我们已经生成了第i块的target_output(即idx)，此时可以用这个idx生成next_token_map
+        #             # 即用这个idx生成i+1块的input_token_map, 其中包括i块中所有内容和预处理信息
+        #             # f_hat[i+1]中包含i块中所有信息，但是不包含i+1块中信息
                     
-                    if not more_smooth: # this is the default case
-                        h_BChw = self.vae_quant_proxy[0].embedding(token_id)
-                    else:   # not used when evaluating FID/IS/Precision/Recall
-                        gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
-                        h_BChw = gumbel_softmax_with_rng(logits.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+        #             if not more_smooth: # this is the default case
+        #                 h_BChw = self.vae_quant_proxy[0].embedding(token_id)
+        #             else:   # not used when evaluating FID/IS/Precision/Recall
+        #                 gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)   # refer to mask-git
+        #                 h_BChw = gumbel_softmax_with_rng(logits.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
                     
-                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
-                    f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-                    current_step += 1
-                    break
+        #             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+        #             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
+        #             current_step += 1
+        #             break
 
-        return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
+        # return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
 # '''
