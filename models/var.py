@@ -183,7 +183,6 @@ class VAR(nn.Module):
             else: 
                 input_token_map = next_token_map
                 input_token_map = input_token_map.view(B, self.Cvae, -1).transpose(1,2)
-                print(f"si {si}, input_token_map.shape: {input_token_map.shape}")
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
@@ -391,6 +390,7 @@ class VAR(nn.Module):
                 input_token_map.view(B, self.Cvae, -1).transpose(1,2)
                 # 我们会保存从输入开始的input_token_map到最后
                 input_token_history.append(input_token_map)
+                print(f"si {si}, input_token_map.shape: {input_token_map.shape}")
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
             
