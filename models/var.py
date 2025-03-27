@@ -366,12 +366,6 @@ class VAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(True)
 
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
-
-            ratio = si / self.num_stages_minus_1
-            cur_L = cur_L + pn * pn
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-            print(f"{si}")
-
             # 快进到current_step
             if si < current_step:
                 continue
@@ -393,7 +387,12 @@ class VAR(nn.Module):
                 print(f"si {si}, input_token_map.shape: {input_token_map.shape}")
                 input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn]
                 input_token_map = input_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-            
+
+            ratio = si / self.num_stages_minus_1
+            cur_L = cur_L + pn * pn
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            print(f"{si}")           
+
             # 我们会保存从输入的f_hat开始到最后
             f_hat_history.append(f_hat)
             
@@ -401,6 +400,10 @@ class VAR(nn.Module):
             # 他没有保存current_step + step - 1的output, 这两个是最后的返回值
 
             x = input_token_map
+            
+
+
+
 
             for block in self.blocks:
                 x = block(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
