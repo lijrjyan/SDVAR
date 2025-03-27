@@ -457,8 +457,9 @@ class VAR(nn.Module):
         sos,
         lvl_pos,
         attn_bias,
-        sindex,
-        pindex,
+        t,
+        start_points,
+        exit_points,
 
         cfg=1.5, top_k=0, top_p=0.0,more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
@@ -483,11 +484,12 @@ class VAR(nn.Module):
         
         # input_token_map = torch.zeros((2 * B, self.first_l, self.C))
         
+        # target model 会利用attn_bias一次性生成所有
         for b in self.blocks: b.attn.kv_caching(True)
         
         input_token_map = unified_next_token_map
         # 这里位置编码的编号要改，从current_step的到current_step + step(没有-1因为我们此时已经有current_step + step的预备内容了)
-        input_token_map = self.word_embed(input_token_map) + lvl_pos[:, cur_L:cur_L + pn * pn] 
+        input_token_map = self.word_embed(input_token_map) + lvl_pos[:, start_points[current_step]:exit_points[current_step + step]] 
         input_token_map.repeat(2,1,1)
 
         x = input_token_map
@@ -496,26 +498,15 @@ class VAR(nn.Module):
             x = block(x=x, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
         logits = self.get_logits(x, cond_BD)
         
-        # 这里需要改，要把t改成每组对应的t
-        t = cfg * ratio
+        # 这里需要改，要把t改成每组对应的t,已经改好了
         logits = (1+t) * logits[:B] - t * logits[B:]
-        # # 我们会保存从输入的logits(融合后的)到最后
-        # logits_history.append(logits)
         
-        # token_id = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-        # # 我们会保存从输入的token_id(融合后的)到最后
-        # token_id_history.append(token_id)
+        token_id = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
 
-
-        # target model 会利用attn_bias一次性生成所有
         for block in self.blocks: block.attn.kv_caching(False)
 
-        # return input_token_history, f_hat_history, logits_history, token_id_history, next_token_map, f_hat
-        # input_token_history: current_step -> current_step + step, len = step + 1
-        # f_hat_history: current_step -> current_step + step, len = step + 1
-        # logits_history: current_step -> current_step + step - 1, len = step
-        # token_id_history: current_step -> current_step + step - 1, len = step
-        return input_token_history, f_hat_history, logits_history, token_id_history
+        # 我们只需要logits
+        return token_id, logits
     # ''' 
 
 class VARHF(VAR, PyTorchModelHubMixin):
@@ -953,7 +944,8 @@ class SDVAR(nn.Module):
         next_token_map = input_token_history[-1]
         f_hat = f_hat_history[-1]
 
-
+        num_stages_minus_1 = len(self.patch_nums) - 1
+        t_per_token = self.get_t_per_token(self.patch_nums, cfg, device=device)
 
         start_points = [0,1,5,14,30,55,91,155,255,424]
         exit_points = [1,5,14,30,55,91,155,255,424,680]
@@ -982,6 +974,7 @@ class SDVAR(nn.Module):
             ) 
             
             draft_unified_next_token_map = torch.cat(draft_input_token_history, dim = 1)
+
 
             # 这里需要改pindex和sindex
             sindex = start_points[current_step]
@@ -1020,11 +1013,17 @@ class SDVAR(nn.Module):
                     rng = self.rng, 
                     sos = target_sos,
                     lvl_pos = target_lvl_pos,
-                    sindex = sindex,
-                    pindex = pindex, 
+                    start_points = start_points,
+                    exit_points = exit_points,
                     attn_bias = attn_bias,
+                    t = t_per_token[:,sindex:pindex,:], # 1,xxx ,1
                     cfg = cfg, top_k = top_k, top_p = top_p, more_smooth = more_smooth
                 )
+            
+            print(f"target_unified_token_id.shape: {target_unified_token_id.shape}")
+            print(f"target_target_logits.shape: {target_unified_logits.shape}")
+            
+            break
             
         #     accept_step = 0
         #     cur_L = 0
@@ -1070,4 +1069,12 @@ class SDVAR(nn.Module):
         #             break
 
         # return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
-'''
+# '''
+    def get_t_per_token(patch_nums, cfg, device=None):
+        num_stages_minus_1 = len(patch_nums) - 1
+        t_per_token = []
+        for si, p in enumerate(patch_nums):
+            t = cfg * (si / num_stages_minus_1)
+            token_count = p * p
+            t_per_token += [t] * token_count
+        return torch.tensor(t_per_token, device=device).view(1, -1, 1)  # shape: (1, total_tokens, 1)
