@@ -336,7 +336,7 @@ class SDVAR(nn.Module):
         top_p: float = 0.0,
         more_smooth: bool = False,
         entry_num: int = 5,
-        sd_mask: int = 5  # 默认使用修改版block-wise掩码
+        sd_mask: int = 5,  # 默认使用修改版block-wise掩码
     ) -> torch.Tensor:
         """
         修复版SDVAR推理函数，解决不同entry_num导致的随机数同步问题
@@ -532,13 +532,16 @@ class SDVAR(nn.Module):
             target_cond_BD_or_gss = self.target_model.shared_ada_lin(target_cond_BD)
             x = target_next_token_map
 
-            # 根据sd_mask参数选择掩码
+            # === 根据sd_mask参数选择掩码策略（便于消融实验） ===
             if sd_mask != 0:
                 pindex = exit_points[si]
                 sindex = start_points[si]
+                
                 if sd_mask == 1:
+                    # SD掩码，包括未预测层的block-wise掩码
                     attn_bias = self.attn_bias_for_sdmasking[:,:,0:pindex,0:pindex].to(device)
                 elif sd_mask == 2:
+                    # SD掩码，不包括未预测层的block-wise掩码
                     attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
                     attn_bias[:, :, sindex:pindex, :] = 0.0
                     attn_bias = attn_bias.to(device)
@@ -551,9 +554,11 @@ class SDVAR(nn.Module):
                     attn_bias[:, :, sindex:pindex, :] = 0.0
                     attn_bias = attn_bias.to(device)
                 
+                # 使用选定的掩码进行前向传播
                 for blk in self.target_model.blocks:
                     x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
             else:
+                # sd_mask = 0: 不使用掩码（baseline）
                 for blk in self.target_model.blocks:
                     x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
 

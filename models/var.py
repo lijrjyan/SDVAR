@@ -1082,14 +1082,16 @@ class SDVAR(nn.Module):
         top_p: float = 0.0,
         more_smooth: bool = False,
         entry_num: int = 5,
+        sd_mask: int = 5,  # 默认使用修改版block-wise掩码
     ) -> torch.Tensor:
         """
-        修复版SDVAR推理函数，解决不同entry_num导致的随机数同步问题
+        修复版SDVAR推理函数，解决不同entry_num导致的随机数同步问题，并支持多种掩码策略
         
         主要改进：
         1. 为draft和target模型创建分离的随机数生成器
         2. 确保target模型始终从相同的随机数状态开始生成
-        3. 保证相同模型和初始化下，无论entry_num如何，最终输出保持一致
+        3. 添加完整的掩码支持，便于消融实验
+        4. 保证相同模型和初始化下，无论entry_num如何，最终输出保持一致
         
         :param B: batch size
         :param label_B: imagenet label; if None, randomly sampled
@@ -1099,6 +1101,13 @@ class SDVAR(nn.Module):
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax
         :param entry_num: 模型切换点，draft_model生成前entry_num个阶段
+        :param sd_mask: 掩码类型选择，便于消融实验
+                      0: 不使用掩码（baseline）
+                      1: 使用SD掩码，包括未预测层的block-wise掩码
+                      2: 使用SD掩码，不包括未预测层的block-wise掩码  
+                      3: 使用标准因果掩码
+                      4: 使用严格block-wise掩码
+                      5: 使用修改版block-wise掩码（默认，推荐）
         :return: reconstructed image (B, 3, H, W) in [0, 1]
         """
         # === 修复1: 创建分离的随机数生成器 ===
@@ -1254,6 +1263,11 @@ class SDVAR(nn.Module):
 
         target_cur_L = draft_cur_L
 
+        # === 设置掩码参数（用于消融实验） ===
+        start_points = [0,1,5,14,30,55,91,155,255,424]
+        exit_points = [1,5,14,30,55,91,155,255,424,680]
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
         # Target模型生成剩余阶段
         for si in range(entry_num, total_stages):
             pn = patch_nums[si]
@@ -1263,15 +1277,47 @@ class SDVAR(nn.Module):
             # 前向传播
             target_cond_BD_or_gss = self.target_model.shared_ada_lin(target_cond_BD)
             x = target_next_token_map
-            for blk in self.target_model.blocks:
-                x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+
+            # === 根据sd_mask参数选择掩码策略（便于消融实验） ===
+            if sd_mask != 0:
+                pindex = exit_points[si]
+                sindex = start_points[si]
+                
+                if sd_mask == 1:
+                    # SD掩码，包括未预测层的block-wise掩码
+                    attn_bias = self.attn_bias_for_sdmasking[:,:,0:pindex,0:pindex].to(device)
+                elif sd_mask == 2:
+                    # SD掩码，不包括未预测层的block-wise掩码
+                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
+                    attn_bias[:, :, sindex:pindex, :] = 0.0
+                    attn_bias = attn_bias.to(device)
+                elif sd_mask == 3:
+                    # 标准因果掩码
+                    attn_bias = self.target_model.attn_bias_for_masking[:,:,0:pindex,0:pindex]
+                elif sd_mask == 4:
+                    # 严格block-wise掩码
+                    attn_bias = self.attn_bias_for_block[:,:,0:pindex,0:pindex].to(device)
+                elif sd_mask == 5:
+                    # 修改版block-wise掩码（默认推荐）
+                    attn_bias = self.attn_bias_for_block[:, :, 0:pindex, 0:pindex].clone()
+                    attn_bias[:, :, sindex:pindex, :] = 0.0
+                    attn_bias = attn_bias.to(device)
+                
+                # 使用选定的掩码进行前向传播
+                for blk in self.target_model.blocks:
+                    x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
+            else:
+                # sd_mask = 0: 不使用掩码（baseline）
+                for blk in self.target_model.blocks:
+                    x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+
             target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
 
             # CFG处理
             t = cfg * ratio
             target_logits_BlV = (1 + t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
 
-            # === 修复3: 使用target专用随机数生成器 ===
+            # === 使用target专用随机数生成器进行采样 ===
             target_idx_Bl = sample_with_top_k_top_p_(
                 target_logits_BlV,
                 rng=target_rng,  # 使用target专用RNG，保证一致性
