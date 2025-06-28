@@ -335,128 +335,8 @@ class SDVAR(nn.Module):
         top_k: int = 0,
         top_p: float = 0.0,
         more_smooth: bool = False,
-    ) -> torch.Tensor:
-        if g_seed is not None:
-            self.draft_model.rng.manual_seed(g_seed)
-            self.target_model.rng.manual_seed(g_seed)
-            rng = self.draft_model.rng
-        else:
-            rng = None
-
-        if label_B is None:
-            label_B = torch.multinomial(
-                self.draft_model.uniform_prob, num_samples=B, replacement=True, generator=rng
-            ).reshape(B)
-        elif isinstance(label_B, int):
-            label_B = torch.full(
-                (B,),
-                fill_value=self.draft_model.num_classes if label_B < 0 else label_B,
-                device=self.draft_model.lvl_1L.device
-            )
-
-        sos = self.draft_model.class_emb(
-            torch.cat((label_B, torch.full_like(label_B, fill_value=self.draft_model.num_classes)), dim=0)
-        )   # shape: (2B, C)
-        lvl_pos = self.draft_model.lvl_embed(self.draft_model.lvl_1L) + self.draft_model.pos_1LC
-        next_token_map = (
-            sos.unsqueeze(1).expand(2*B, self.draft_model.first_l, -1)
-            + self.draft_model.pos_start.expand(2*B, self.draft_model.first_l, -1)
-            + lvl_pos[:, :self.draft_model.first_l]
-        )
-        f_hat = sos.new_zeros(B, self.draft_model.Cvae, self.draft_model.patch_nums[-1], self.draft_model.patch_nums[-1])
-
-        for blk in self.draft_model.blocks:
-            blk.attn.kv_caching(True)
-        for blk in self.target_model.blocks:
-            blk.attn.kv_caching(True)
-
-        si = 0
-        cur_L = 0
-        total_stages = len(self.draft_model.patch_nums)
-
-        while si < total_stages:
-            draft_count = min(self.draft_steps, total_stages - si)
-
-            expansions = []
-            backup_f_hat = f_hat.clone()
-            backup_next_map = next_token_map.clone()
-            backup_cur_L = cur_L
-
-            local_si = si
-            local_f_hat = f_hat
-            local_map = next_token_map
-            local_cur_L = cur_L
-
-            for step_i in range(draft_count):
-                pn = self.draft_model.patch_nums[local_si]
-                ratio = (
-                    local_si / self.draft_model.num_stages_minus_1
-                    if self.draft_model.num_stages_minus_1 > 0 else 0
-                )
-                local_cur_L_next = local_cur_L + pn*pn
-
-                cond_BD_or_gss = self.draft_model.shared_ada_lin(sos)
-                x = local_map
-                for blk in self.draft_model.blocks:
-                    x = blk(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-                logits_draft = self.draft_model.get_logits(x, sos)
-
-                t = cfg * ratio
-                logits_draft = (1+t)*logits_draft[:B] - t*logits_draft[B:]  # (B, l, V)
-
-                idx_Bl = sample_with_top_k_top_p_(
-                    logits_draft, rng=rng, top_k=top_k, top_p=top_p, num_samples=1
-                )[:, :, 0]
-
-                if not more_smooth:
-                    emb_BlC = self.draft_model.vae_quant_proxy[0].embedding(idx_Bl)
-                else:
-                    emb_BlC = self.draft_model.vae_quant_proxy[0].embedding(idx_Bl)
-                h_BChw = emb_BlC.transpose(1,2).reshape(B, self.draft_model.Cvae, pn, pn)
-                local_f_hat, local_map = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
-                    local_si, total_stages, local_f_hat, h_BChw
-                )
-
-                if local_si != (total_stages-1):
-                    next_pn = self.draft_model.patch_nums[local_si+1]
-                    local_map = local_map.view(B, self.draft_model.Cvae, -1).transpose(1,2)
-                    local_map = (
-                        self.draft_model.word_embed(local_map)
-                        + lvl_pos[:, local_cur_L_next : local_cur_L_next + next_pn*next_pn]
-                    )
-                    local_map = local_map.repeat(2,1,1)
-
-                expansions.append({
-                    'si': local_si,
-                    'pn': pn,
-                    'cur_L': local_cur_L,
-                    'cur_L_next': local_cur_L_next,
-                    'idx_Bl': idx_Bl,
-                    'emb_BlC': emb_BlC,
-                    'ratio': ratio,
-                    'f_hat': local_f_hat.clone(),
-                    'next_map': local_map.clone(),
-                })
-
-                local_si += 1
-                local_cur_L = local_cur_L_next
-                f_hat = local_f_hat
-                next_token_map = local_map
-
-                if local_si >= total_stages:
-                    break
-
-    @torch.no_grad()
-    def sdvar_autoregressive_infer_cfg_sd_test4(
-        self,
-        B: int,
-        label_B: Optional[Union[int, torch.LongTensor]],
-        g_seed: Optional[int] = None,
-        cfg: float = 1.5,
-        top_k: int = 0,
-        top_p: float = 0.0,
-        more_smooth: bool = False,
         entry_num: int = 5,
+        sd_mask: int = 5  # 默认使用修改版block-wise掩码
     ) -> torch.Tensor:
         """
         修复版SDVAR推理函数，解决不同entry_num导致的随机数同步问题
@@ -464,7 +344,8 @@ class SDVAR(nn.Module):
         主要改进：
         1. 为draft和target模型创建分离的随机数生成器
         2. 确保target模型始终从相同的随机数状态开始生成
-        3. 保证相同模型和初始化下，无论entry_num如何，最终输出保持一致
+        3. 添加掩码支持，默认使用修改版block-wise掩码
+        4. 保证相同模型和初始化下，无论entry_num如何，最终输出保持一致
         
         :param B: batch size
         :param label_B: imagenet label; if None, randomly sampled
@@ -474,6 +355,13 @@ class SDVAR(nn.Module):
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax
         :param entry_num: 模型切换点，draft_model生成前entry_num个阶段
+        :param sd_mask: 掩码类型选择
+                      0: 不使用掩码
+                      1: 全部层包括未预测这层进行block-wise的掩码
+                      2: 全部层不包括未预测这层进行block-wise的掩码
+                      3: 因果掩码
+                      4: block-wise掩码
+                      5: 修改版block-wise掩码（默认）
         :return: reconstructed image (B, 3, H, W) in [0, 1]
         """
         # === 修复1: 创建分离的随机数生成器 ===
@@ -629,6 +517,11 @@ class SDVAR(nn.Module):
 
         target_cur_L = draft_cur_L
 
+        # === 修复3: 设置掩码 ===
+        start_points = [0,1,5,14,30,55,91,155,255,424]
+        exit_points = [1,5,14,30,55,91,155,255,424,680]
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
         # Target模型生成剩余阶段
         for si in range(entry_num, total_stages):
             pn = patch_nums[si]
@@ -638,18 +531,42 @@ class SDVAR(nn.Module):
             # 前向传播
             target_cond_BD_or_gss = self.target_model.shared_ada_lin(target_cond_BD)
             x = target_next_token_map
-            for blk in self.target_model.blocks:
-                x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+
+            # 根据sd_mask参数选择掩码
+            if sd_mask != 0:
+                pindex = exit_points[si]
+                sindex = start_points[si]
+                if sd_mask == 1:
+                    attn_bias = self.attn_bias_for_sdmasking[:,:,0:pindex,0:pindex].to(device)
+                elif sd_mask == 2:
+                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
+                    attn_bias[:, :, sindex:pindex, :] = 0.0
+                    attn_bias = attn_bias.to(device)
+                elif sd_mask == 3:
+                    attn_bias = self.target_model.attn_bias_for_masking[:,:,0:pindex,0:pindex]
+                elif sd_mask == 4:
+                    attn_bias = self.attn_bias_for_block[:,:,0:pindex,0:pindex].to(device)
+                elif sd_mask == 5:
+                    attn_bias = self.attn_bias_for_block[:, :, 0:pindex, 0:pindex].clone()
+                    attn_bias[:, :, sindex:pindex, :] = 0.0
+                    attn_bias = attn_bias.to(device)
+                
+                for blk in self.target_model.blocks:
+                    x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
+            else:
+                for blk in self.target_model.blocks:
+                    x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+
             target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
 
             # CFG处理
             t = cfg * ratio
             target_logits_BlV = (1 + t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
 
-            # === 修复3: 使用target专用随机数生成器 ===
+            # === 修复4: 使用target专用随机数生成器 ===
             target_idx_Bl = sample_with_top_k_top_p_(
                 target_logits_BlV,
-                rng=target_rng,  # 使用target专用RNG，保证一致性
+                rng=target_rng,  # 使用target专用RNG
                 top_k=top_k,
                 top_p=top_p,
                 num_samples=1
