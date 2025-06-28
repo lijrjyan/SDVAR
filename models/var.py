@@ -1165,31 +1165,39 @@ class SDVAR(nn.Module):
         top_k: int = 0,
         top_p: float = 0.0,
         more_smooth: bool = False,
-        entry_num: int = 10, 
-        sd_mask: int = 0
-    ) -> torch.Tensor:
-        """
-        Test5: 在 draft 和 target 模型中比较 logits 是否一致。
-        """
+        entry_num: int = 10,
+        sd_mask: int = 0,
+    ):
+        """Test 5 — compare logits produced by *draft* (up‑to‑`entry_num-1`) and *target* (at `entry_num`) on **exactly the same token slice**.
+    
+        *   When `entry_num == 0` we skip comparison (draft没有生成任何 token)。
+        *   For `entry_num > 0` we:
+            1.  让 **draft** 正常生成到 `entry_num-1`；
+            2.  构造 *target* 的 `next_token_map`；
+            3.  取 **完全相同的 token slice** `sindex:pindex`（全局 token 索引）传入 **draft** 再跑一次 forward 以得到 `draft_logits_ref`；
+            4.  在 *target* 第一步 (`si == entry_num`) 得到 `target_logits_BlV`，做差并打印最大误差。"""
+    
+        ########################################################################
+        # 0. 早期退出：entry_num == 0 无可比性
+        ########################################################################
         if entry_num == 0:
-            print(f"[TEST5][SKIP] entry_num=0 too early to compare logits. Returning dummy tensor.")
+            print("[TEST5][SKIP] entry_num=0 (no draft context) — comparison meaningless.")
             device = self.target_model.lvl_1L.device
             return torch.zeros((B, 3, 256, 256), device=device)
     
+        ########################################################################
+        # 1. 基础一致性检查 & 公共变量
+        ########################################################################
         assert self.draft_model.patch_nums == self.target_model.patch_nums
-        assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
-        self.patch_nums = self.draft_model.patch_nums
-        self.num_stages_minus_1 = self.draft_model.num_stages_minus_1
-        total_stages = len(self.patch_nums)
-    
-        self.vae_proxy = self.target_model.vae_proxy
-        self.vae_quant_proxy = self.target_model.vae_quant_proxy
+        patch_nums = self.draft_model.patch_nums
+        num_stages_minus_1 = len(patch_nums) - 1
     
         if g_seed is not None:
             self.rng = self.target_model.rng.manual_seed(g_seed)
         else:
             self.rng = None
     
+        # label 处理
         if label_B is None:
             label_B = torch.multinomial(
                 self.target_model.uniform_prob, num_samples=B, replacement=True, generator=self.rng
@@ -1198,173 +1206,101 @@ class SDVAR(nn.Module):
             label_B = torch.full(
                 (B,),
                 fill_value=self.target_model.num_classes if label_B < 0 else label_B,
-                device=self.target_model.lvl_1L.device
+                device=self.target_model.lvl_1L.device,
             )
     
-        draft_sos, draft_cond_BD, draft_cond_BD_or_gss, \
-        draft_lvl_pos, draft_first_token_map, draft_f_hat = self.init_param(self.draft_model, B, label_B)
+        ########################################################################
+        # 2. 让 DRAFT 生成到 entry_num-1
+        ########################################################################
+        draft_sos, draft_cond_BD, draft_cond_BD_or_gss, draft_lvl_pos, draft_next_token_map, draft_f_hat = self.init_param(
+            self.draft_model, B, label_B
+        )
     
-        draft_cur_L = 0
-        draft_next_token_map = draft_first_token_map
-        draft_token_hub = []
-    
+        cur_L = 0
         for blk in self.draft_model.blocks:
-            blk.attn.kv_caching(False)
+            blk.attn.kv_caching(False)  # 禁用 KV cache 以避免历史残留
     
-        draft_logits_ref = None
-    
-        for si, pn in enumerate(self.patch_nums):
+        for si, pn in enumerate(patch_nums):
             if si >= entry_num:
-                break
+                break  # 只跑到 entry_num-1
     
-            ratio = si / self.num_stages_minus_1
-            draft_cur_L += pn * pn
+            # forward
             x = draft_next_token_map
-    
             for blk in self.draft_model.blocks:
                 x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
-            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)
+            logits = self.draft_model.get_logits(x, draft_cond_BD)
+            t_si = cfg * (si / num_stages_minus_1)
+            logits = (1 + t_si) * logits[:B] - t_si * logits[B:]
     
-            t = cfg * ratio
-            draft_logits_BlV = (1 + t) * draft_logits_BlV[:B] - t * draft_logits_BlV[B:]
+            idx = sample_with_top_k_top_p_(logits, rng=self.rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
+            h = self.vae_quant_proxy[0].embedding(idx).transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+            draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(patch_nums), draft_f_hat, h)
     
-            if si == entry_num - 1:
-                draft_logits_ref = draft_logits_BlV.detach().clone()
-    
-            draft_idx_Bl = sample_with_top_k_top_p_(
-                draft_logits_BlV,
-                rng=self.rng,
-                top_k=top_k,
-                top_p=top_p,
-                num_samples=1
-            )[:, :, 0]
-    
-            if not more_smooth:
-                draft_h_BChw = self.vae_quant_proxy[0].embedding(draft_idx_Bl)
-            else:
-                draft_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
-                draft_h_BChw = gumbel_softmax_with_rng(
-                    draft_logits_BlV.mul(1 + ratio), tau=draft_gum_t, hard=False, dim=-1, rng=self.rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-    
-            draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
-            draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
-                si, total_stages, draft_f_hat, draft_h_BChw
-            )
-    
-            if si != self.num_stages_minus_1:
-                next_pn = self.patch_nums[si + 1]
+            cur_L += pn * pn
+            if si != len(patch_nums) - 1:
+                next_pn = patch_nums[si + 1]
                 draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
-                draft_token_hub.append(draft_next_token_map)
-                draft_next_token_map = (
-                    self.draft_model.word_embed(draft_next_token_map)
-                    + draft_lvl_pos[:, draft_cur_L: draft_cur_L + next_pn * next_pn]
-                )
+                draft_next_token_map = self.draft_model.word_embed(draft_next_token_map) + draft_lvl_pos[:, cur_L : cur_L + next_pn * next_pn]
                 draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)
     
-        if len(draft_token_hub) != 0:
-            draft_token_hub = torch.cat(draft_token_hub, dim=1)
-        for blk in self.draft_model.blocks:
-            blk.attn.kv_caching(False)
+        # draft 到 entry_num-1 结束，draft_next_token_map 现在正对应 entry_num 的输入
     
+        ########################################################################
+        # 3. 计算与 target 相同 slice 的 draft_logits_ref
+        ########################################################################
         start_points = [0, 1, 5, 14, 30, 55, 91, 155, 255, 424]
         exit_points = [1, 5, 14, 30, 55, 91, 155, 255, 424, 680]
-        pindex = exit_points[entry_num]
-        sindex = start_points[entry_num]
+    
+        sindex, pindex = start_points[entry_num], exit_points[entry_num]
         device = self.target_model.lvl_1L.device
     
-        target_sos, target_cond_BD, target_cond_BD_or_gss, \
-        target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
+        slice_tokens = draft_next_token_map[:, sindex:pindex]  # (2B, L_slice, C)
+        x_draft_cmp = slice_tokens.clone()  # 防止原 tensor 被修改
+        for blk in self.draft_model.blocks:
+            x_draft_cmp = blk(x=x_draft_cmp, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
+        draft_logits_ref = self.draft_model.get_logits(x_draft_cmp, draft_cond_BD)
+        t_entry = cfg * (entry_num / num_stages_minus_1)
+        draft_logits_ref = (1 + t_entry) * draft_logits_ref[:B] - t_entry * draft_logits_ref[B:]
     
-        target_f_hat = draft_f_hat
-        target_cur_L = 0
+        ########################################################################
+        # 4. 构造 TARGET 的初始 next_token_map（包含 draft 已生成部分）
+        ########################################################################
+        target_sos, target_cond_BD, target_cond_BD_or_gss, target_lvl_pos, target_next_token_map0, target_f_hat = self.init_param(
+            self.target_model, B, label_B
+        )
     
-        if len(draft_token_hub) != 0:
-            target_next_token_map = draft_token_hub
-            target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, 1:pindex]
-            target_next_token_map = target_next_token_map.repeat(2, 1, 1)
-            target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
+        if cur_L > 0:
+            # 把 draft 已生成 token 塞回 target 输入
+            prev_tokens = draft_next_token_map[:, : cur_L].view(B, self.draft_model.Cvae, -1).transpose(1, 2)
+            prev_emb = self.target_model.word_embed(prev_tokens) + target_lvl_pos[:, 1 : 1 + cur_L]
+            target_next_token_map = torch.cat([target_next_token_map0, prev_emb.repeat(2, 1, 1)], dim=1)
         else:
-            target_next_token_map = target_first_token_map
+            target_next_token_map = target_next_token_map0
     
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(False)
     
-        for si, pn in enumerate(self.patch_nums):
-            ratio = si / self.num_stages_minus_1
-            target_cur_L += pn * pn
-            t = cfg * ratio
-    
-            if si < entry_num:
-                continue
-    
-            if sd_mask != 0:
-                if sd_mask == 1:
-                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].to(device)
-                elif sd_mask == 2:
-                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
-                    attn_bias[:, :, sindex:pindex, :] = 0.0
-                    attn_bias = attn_bias.to(device)
-                elif sd_mask == 3:
-                    attn_bias = self.target_model.attn_bias_for_masking[:, :, 0:pindex, 0:pindex]
-                elif sd_mask == 4:
-                    attn_bias = self.attn_bias_for_block[:, :, 0:pindex, 0:pindex].to(device)
-                elif sd_mask == 5:
-                    attn_bias = self.attn_bias_for_block[:, :, 0:pindex, 0:pindex].clone()
-                    attn_bias[:, :, sindex:pindex, :] = 0.0
-                    attn_bias = attn_bias.to(device)
-            else:
-                attn_bias = None
-    
-            x = target_next_token_map[:, sindex:pindex] if si == entry_num else target_next_token_map
-            for b in self.target_model.blocks:
-                x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias if si == entry_num else None)
-    
-            target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
-            target_logits_BlV = (1 + t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
-    
-            if si == entry_num:
-                if draft_logits_ref is None:
-                    print(f"[TEST5][WARN] No draft logits recorded at entry_num={entry_num}, skipping comparison.")
-                else:
-                    diff = (target_logits_BlV - draft_logits_ref).abs().max().item()
-                    print(f"[TEST5][COMPARE] Max diff between draft and target logits at entry_num={entry_num}: {diff:.6f}")
-    
-            target_idx_Bl = sample_with_top_k_top_p_(
-                target_logits_BlV,
-                rng=self.rng,
-                top_k=top_k,
-                top_p=top_p,
-                num_samples=1
-            )[:, :, 0]
-    
-            if not more_smooth:
-                target_h_BChw = self.vae_quant_proxy[0].embedding(target_idx_Bl)
-            else:
-                target_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
-                target_h_BChw = gumbel_softmax_with_rng(
-                    target_logits_BlV.mul(1 + ratio),
-                    tau=target_gum_t,
-                    hard=False,
-                    dim=-1,
-                    rng=self.rng
-                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-    
-            target_h_BChw = target_h_BChw.transpose_(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
-            target_f_hat, target_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
-                si, len(self.patch_nums), target_f_hat, target_h_BChw
-            )
-    
-            if si != self.num_stages_minus_1:
-                next_pn = self.patch_nums[si + 1]
-                target_next_token_map = target_next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
-                target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, target_cur_L:target_cur_L + next_pn * next_pn]
-                target_next_token_map = target_next_token_map.repeat(2, 1, 1)
-    
+        ########################################################################
+        # 5. TARGET 在 entry_num 位置前向，得到 logits 并比较
+        ########################################################################
+        x_target_cmp = target_next_token_map[:, sindex:pindex]
         for blk in self.target_model.blocks:
-            blk.attn.kv_caching(False)
+            x_target_cmp = blk(x=x_target_cmp, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+        target_logits_cmp = self.target_model.get_logits(x_target_cmp, target_cond_BD)
+        target_logits_cmp = (1 + t_entry) * target_logits_cmp[:B] - t_entry * target_logits_cmp[B:]
     
-        return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
+        # shape sanity
+        if draft_logits_ref.shape != target_logits_cmp.shape:
+            print(f"[TEST5][SHAPE] draft {draft_logits_ref.shape} vs target {target_logits_cmp.shape}")
+        diff = (target_logits_cmp - draft_logits_ref).abs().max().item()
+        print(f"[TEST5][COMPARE] entry_num={entry_num} — max|Δlogits| = {diff:.6f}")
+    
+        ########################################################################
+        # 6. 继续让 TARGET 完成剩余生成（可选，也可以直接返回）
+        ########################################################################
+        # 此处为了简洁，直接返回 draft 输出图像（不影响 logits 对比结论）
+        return self.vae_proxy[0].fhat_to_img(draft_f_hat).add_(1).mul_(0.5)  # (B,3,H,W)
+
 
     def get_t_per_token(patch_nums, cfg, device=None):
         num_stages_minus_1 = len(patch_nums) - 1
