@@ -1152,6 +1152,56 @@ class SDVAR(nn.Module):
 
         # 返回最终图像
         return self.target_model.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
+    @torch.no_grad()
+    def sdvar_autoregressive_infer_cfg_sd_test3_with_debug_log(self, *args, **kwargs):
+        """
+        Debug 版本的 test3，使用共享 RNG，并打印 RNG 状态哈希。
+        """
+        print("[DEBUG] Running sd_test3 with debug log (shared RNG)...")
+        self.rng = torch.Generator(device=self.target_model.lvl_1L.device)
+        g_seed = kwargs.get("g_seed", 1234)
+        self.rng.manual_seed(g_seed)
+    
+        from models.helpers import sample_with_debug_log
+    
+        # 替换 sample_with_top_k_top_p_ 为 sample_with_debug_log 的局部包装
+        global sample_with_top_k_top_p_
+        _orig_sampler = sample_with_top_k_top_p_
+        sample_with_top_k_top_p_ = lambda *a, **kw: sample_with_debug_log(*a, **kw, label="test3")
+    
+        try:
+            return self.sdvar_autoregressive_infer_cfg_sd_test3(*args, **kwargs)
+        finally:
+            sample_with_top_k_top_p_ = _orig_sampler  # 恢复原采样器
+    
+    
+    @torch.no_grad()
+    def sdvar_autoregressive_infer_cfg_sd_test4_with_debug_log(self, *args, **kwargs):
+        """
+        Debug 版本的 test4，使用分离 RNG，并打印 draft/target 阶段的 RNG 状态哈希。
+        """
+        print("[DEBUG] Running sd_test4 with debug log (separated RNG)...")
+        g_seed = kwargs.get("g_seed", 1234)
+        draft_rng = torch.Generator(device=self.draft_model.lvl_1L.device).manual_seed(g_seed)
+        target_rng = torch.Generator(device=self.target_model.lvl_1L.device).manual_seed(g_seed)
+    
+        from models.helpers import sample_with_debug_log
+    
+        global sample_with_top_k_top_p_
+        _orig_sampler = sample_with_top_k_top_p_
+    
+        def sampler_with_routing(logits, top_k=0, top_p=0.0, rng=None, num_samples=1, label=""):
+            if "draft" in label:
+                return sample_with_debug_log(logits, top_k, top_p, rng=draft_rng, num_samples=num_samples, label=label)
+            else:
+                return sample_with_debug_log(logits, top_k, top_p, rng=target_rng, num_samples=num_samples, label=label)
+    
+        sample_with_top_k_top_p_ = sampler_with_routing
+    
+        try:
+            return self.sdvar_autoregressive_infer_cfg_sd_test4(*args, **kwargs)
+        finally:
+            sample_with_top_k_top_p_ = _orig_sampler  # 恢复
 
     def get_t_per_token(patch_nums, cfg, device=None):
         num_stages_minus_1 = len(patch_nums) - 1
