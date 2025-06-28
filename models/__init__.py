@@ -1,25 +1,22 @@
 """
-Sdvar  DEBUG / TEST UTILITIES  – rev-4  (KV-cache **ON**)
----------------------------------------------------------
-* same as rev-3 but **re-enables KV caching** everywhere so that the
-  speculative-decoding path now matches the real inference path.
-
-  ▸   helper `_ctx()` now calls `blk.attn.kv_caching(True)` so every
-      forward keeps its keys/values for subsequent tokens.
-  ▸   after each big section we turn it back **off** to avoid memory
-      leaks during the analysis-only pass.
-
-* `test-5` unchanged in logic – it now benefits from the speed-up of
-  cached KV while continuing to compute the exact same slice logits.
+Sdvar  DEBUG / TEST UTILITIES  – rev‑5  (KV‑cache **ON**)  ✅
+----------------------------------------------------------------
+* Keeps KV‑cache **enabled** for *both* draft & target during the
+  whole debug pass.
+* Fixes the *4‑vs‑9 token* shape mismatch: we now always compare
+  the **previous stage** tokens (size =`pnums[entry_num‑1]**2`) so
+  draft & target slice lengths match.
+* Adds optional `verbose=True` to print extra tensor shapes.
+* Builder unchanged; still supports `same_weights_debug=True`.
 """
 
 from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
-# ---------------------------------------------------------------------
-#  build helpers  ------------------------------------------------------
-# ---------------------------------------------------------------------
+# ------------------------------------------------------------------
+#  build helpers  ---------------------------------------------------
+# ------------------------------------------------------------------
 
 
 def build_vae_var_speculative_decoding(
@@ -45,13 +42,11 @@ def build_vae_var_speculative_decoding(
     *,
     same_weights_debug: bool = False,
 ):
-    """Builder that can optionally clone draft weights into target for debugging."""
+    """Builder; see rev‑4, unchanged here."""
 
-    # delay heavy imports – keep top of file light
     from .vqvae import VQVAE
     from .var import VAR, SDVAR
 
-    # disable default init for speed
     for clz in (
         nn.Linear,
         nn.LayerNorm,
@@ -64,7 +59,6 @@ def build_vae_var_speculative_decoding(
     ):
         setattr(clz, "reset_parameters", lambda self: None)
 
-    # ─── shared VQVAE ────────────────────────────────────────────────
     vae_local = VQVAE(
         vocab_size=V,
         z_channels=Cvae,
@@ -99,10 +93,9 @@ def build_vae_var_speculative_decoding(
         )
         return var
 
-    var_draft  = _make_var(depth_draft)
+    var_draft = _make_var(depth_draft)
     var_target = _make_var(depth_target)
 
-    # ─── DEBUG: clone draft weights into target ──────────────────────
     if same_weights_debug:
         var_target.load_state_dict(var_draft.state_dict(), strict=True)
         print("[DEBUG] target weights cloned from draft (same_weights_debug=True)")
