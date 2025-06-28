@@ -1154,6 +1154,7 @@ class SDVAR(nn.Module):
 
         # 返回最终图像
         return self.target_model.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
+        
     @torch.no_grad()
     def sdvar_autoregressive_infer_cfg_sd_test5(
         self,
@@ -1171,9 +1172,10 @@ class SDVAR(nn.Module):
         Test5: 在 draft 和 target 模型中比较 logits 是否一致。
         """
         if entry_num == 0:
-        print(f"[TEST5][SKIP] entry_num=0 too early to compare logits. Returning dummy tensor.")
-        return torch.zeros((B, 3, 256, 256), device=self.device)
-
+            print(f"[TEST5][SKIP] entry_num=0 too early to compare logits. Returning dummy tensor.")
+            device = self.target_model.lvl_1L.device
+            return torch.zeros((B, 3, 256, 256), device=device)
+    
         assert self.draft_model.patch_nums == self.target_model.patch_nums
         assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
@@ -1216,15 +1218,15 @@ class SDVAR(nn.Module):
                 break
     
             ratio = si / self.num_stages_minus_1
-            draft_cur_L += pn*pn
+            draft_cur_L += pn * pn
             x = draft_next_token_map
     
             for blk in self.draft_model.blocks:
                 x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
-            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)            
+            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)
     
             t = cfg * ratio
-            draft_logits_BlV = (1+t)*draft_logits_BlV[:B] - t*draft_logits_BlV[B:]
+            draft_logits_BlV = (1 + t) * draft_logits_BlV[:B] - t * draft_logits_BlV[B:]
     
             if si == entry_num - 1:
                 draft_logits_ref = draft_logits_BlV.detach().clone()
@@ -1245,31 +1247,31 @@ class SDVAR(nn.Module):
                     draft_logits_BlV.mul(1 + ratio), tau=draft_gum_t, hard=False, dim=-1, rng=self.rng
                 ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
     
-            draft_h_BChw = draft_h_BChw.transpose(1,2).reshape(B, self.draft_model.Cvae, pn, pn)
+            draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
             draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, total_stages, draft_f_hat, draft_h_BChw
             )
     
             if si != self.num_stages_minus_1:
-                next_pn = self.patch_nums[si+1]
-                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1,2)
+                next_pn = self.patch_nums[si + 1]
+                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
                 draft_token_hub.append(draft_next_token_map)
                 draft_next_token_map = (
                     self.draft_model.word_embed(draft_next_token_map)
-                    + draft_lvl_pos[:, draft_cur_L : draft_cur_L + next_pn*next_pn]
+                    + draft_lvl_pos[:, draft_cur_L: draft_cur_L + next_pn * next_pn]
                 )
-                draft_next_token_map = draft_next_token_map.repeat(2,1,1)
+                draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)
     
-        if len(draft_token_hub) != 0:   
-            draft_token_hub = torch.cat(draft_token_hub, dim = 1)
+        if len(draft_token_hub) != 0:
+            draft_token_hub = torch.cat(draft_token_hub, dim=1)
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(False)
     
-        start_points = [0,1,5,14,30,55,91,155,255,424]
-        exit_points = [1,5,14,30,55,91,155,255,424,680]
+        start_points = [0, 1, 5, 14, 30, 55, 91, 155, 255, 424]
+        exit_points = [1, 5, 14, 30, 55, 91, 155, 255, 424, 680]
         pindex = exit_points[entry_num]
         sindex = start_points[entry_num]
-        device = torch.device("cuda:0")
+        device = self.target_model.lvl_1L.device
     
         target_sos, target_cond_BD, target_cond_BD_or_gss, \
         target_lvl_pos, target_first_token_map, target_f_hat = self.init_param(self.target_model, B, label_B)
@@ -1277,15 +1279,12 @@ class SDVAR(nn.Module):
         target_f_hat = draft_f_hat
         target_cur_L = 0
     
-        if not len(draft_token_hub) == 0:
+        if len(draft_token_hub) != 0:
             target_next_token_map = draft_token_hub
-            target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:,1:pindex]  
+            target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, 1:pindex]
             target_next_token_map = target_next_token_map.repeat(2, 1, 1)
-            if len(target_next_token_map) != 0:
-                target_next_token_map = torch.cat([target_first_token_map,target_next_token_map],dim=1)
-            else:
-                target_next_token_map = target_first_token_map
-        else: 
+            target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
+        else:
             target_next_token_map = target_first_token_map
     
         for blk in self.target_model.blocks:
@@ -1293,51 +1292,36 @@ class SDVAR(nn.Module):
     
         for si, pn in enumerate(self.patch_nums):
             ratio = si / self.num_stages_minus_1
-            target_cur_L += pn*pn
-            t = cfg * ratio 
+            target_cur_L += pn * pn
+            t = cfg * ratio
     
             if si < entry_num:
                 continue
     
             if sd_mask != 0:
                 if sd_mask == 1:
-                    attn_bias = self.attn_bias_for_sdmasking[:,:,0:pindex,0:pindex].to(device)
+                    attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].to(device)
                 elif sd_mask == 2:
                     attn_bias = self.attn_bias_for_sdmasking[:, :, 0:pindex, 0:pindex].clone()
                     attn_bias[:, :, sindex:pindex, :] = 0.0
                     attn_bias = attn_bias.to(device)
                 elif sd_mask == 3:
-                    attn_bias = self.target_model.attn_bias_for_masking[:,:,0:pindex,0:pindex]
-                elif sd_mask == 4: 
-                    attn_bias = self.attn_bias_for_block[:,:,0:pindex,0:pindex].to(device)
+                    attn_bias = self.target_model.attn_bias_for_masking[:, :, 0:pindex, 0:pindex]
+                elif sd_mask == 4:
+                    attn_bias = self.attn_bias_for_block[:, :, 0:pindex, 0:pindex].to(device)
                 elif sd_mask == 5:
                     attn_bias = self.attn_bias_for_block[:, :, 0:pindex, 0:pindex].clone()
                     attn_bias[:, :, sindex:pindex, :] = 0.0
                     attn_bias = attn_bias.to(device)
-                x = target_next_token_map
-                if si == entry_num:
-                    for b in self.target_model.blocks:
-                        x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias)
-                else:
-                    for b in self.target_model.blocks:
-                        x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
-    
-                if si == entry_num:
-                    x = target_next_token_map[:,sindex:pindex]
-                    target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
-                else:
-                    target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
             else:
-                if si == entry_num:
-                    x = target_next_token_map[:,sindex:pindex]
-                else:
-                    x = target_next_token_map
-                if si >= entry_num:
-                    for b in self.target_model.blocks:
-                        x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
-                target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+                attn_bias = None
     
-            target_logits_BlV = (1+t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
+            x = target_next_token_map[:, sindex:pindex] if si == entry_num else target_next_token_map
+            for b in self.target_model.blocks:
+                x = b(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=attn_bias if si == entry_num else None)
+    
+            target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+            target_logits_BlV = (1 + t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
     
             if si == entry_num:
                 if draft_logits_ref is None:
@@ -1345,7 +1329,6 @@ class SDVAR(nn.Module):
                 else:
                     diff = (target_logits_BlV - draft_logits_ref).abs().max().item()
                     print(f"[TEST5][COMPARE] Max diff between draft and target logits at entry_num={entry_num}: {diff:.6f}")
-
     
             target_idx_Bl = sample_with_top_k_top_p_(
                 target_logits_BlV,
@@ -1373,13 +1356,13 @@ class SDVAR(nn.Module):
             )
     
             if si != self.num_stages_minus_1:
-                next_pn = self.patch_nums[si+1]
+                next_pn = self.patch_nums[si + 1]
                 target_next_token_map = target_next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
                 target_next_token_map = self.target_model.word_embed(target_next_token_map) + target_lvl_pos[:, target_cur_L:target_cur_L + next_pn * next_pn]
                 target_next_token_map = target_next_token_map.repeat(2, 1, 1)
     
         for blk in self.target_model.blocks:
-            blk.attn.kv_caching(False)   
+            blk.attn.kv_caching(False)
     
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
 
