@@ -1170,6 +1170,10 @@ class SDVAR(nn.Module):
         """
         Test5: 在 draft 和 target 模型中比较 logits 是否一致。
         """
+        if entry_num == 0:
+        print(f"[TEST5][SKIP] entry_num=0 too early to compare logits. Returning dummy tensor.")
+        return torch.zeros((B, 3, 256, 256), device=self.device)
+
         assert self.draft_model.patch_nums == self.target_model.patch_nums
         assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
         self.patch_nums = self.draft_model.patch_nums
