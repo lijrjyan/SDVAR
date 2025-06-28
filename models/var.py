@@ -1159,112 +1159,123 @@ class SDVAR(nn.Module):
     #  Test‑5 logits comparison  -------------------------------------------
     # ---------------------------------------------------------------------
     
+    # ------------------------------------------------------------------
+    #  Test-5 -- 对齐 logits（KV-cache ON，shape-safe）  ✅
+    # ------------------------------------------------------------------
     @torch.no_grad()
     def sdvar_autoregressive_infer_cfg_sd_test5(
         self,
         B: int,
-        label_B: Optional[Union[int, torch.LongTensor]],
+        label_B: Optional[Union[int, torch.LongTensor]] = None,
+        *,
         g_seed: Optional[int] = None,
         cfg: float = 1.5,
         top_k: int = 0,
         top_p: float = 0.0,
-        more_smooth: bool = False,
-        entry_num: int = 10,
+        more_smooth: bool = False,      # 保留以防以后用
+        entry_num: int = 2,             # 要比较的 “接管点”
+        verbose: bool = False,          # 打印中间 shape 与 slice 信息
     ):
-        """Compare Draft vs Target logits on the same token slice.
-    
-        * `entry_num==0` 直接跳过。
-        * 两边 **必须** patch_nums 相同；若要测 RNG 逻辑，请先确保权重一致（可用 `same_weights_debug=True`）。"""
-    
-        if entry_num == 0:
-            print("[TEST5][SKIP] entry_num=0 — nothing to compare.")
-            device = self.target_model.lvl_1L.device
-            return torch.zeros((B, 3, 256, 256), device=device)
-    
-        # shorthand
+        """
+        比较 draft / target 在 **entry_num-1** 阶段 token-slice 上的 logits。
+
+        为什么用上一阶段？  
+        部分 stage（如 2× 上采样）会使 token 数翻倍，直接比较
+        entry_num 阶段会出现切片长度不一致（4 ↔ 9）。  
+        取 *上一阶段* 则两边长度必相同。
+        """
+        # ---------- 基本检查 ----------
         draft, target = self.draft_model, self.target_model
-        assert draft.patch_nums == target.patch_nums, "patch_nums mismatch"
-        patch_nums = draft.patch_nums
-        num_stages_minus_1 = len(patch_nums) - 1
-    
-        # RNG
+        assert draft.patch_nums == target.patch_nums, "patch_nums 不一致"
+        pnums = draft.patch_nums
+        num_stage_m1 = len(pnums) - 1
+        assert 1 <= entry_num <= num_stage_m1, "entry_num 必须 ∈[1, len-1]"
+
+        # ---------- RNG ----------
         rng = torch.Generator(device=target.lvl_1L.device)
         if g_seed is not None:
             rng.manual_seed(g_seed)
-    
-        # label tensor
+
+        # ---------- 标签 ----------
         if label_B is None:
-            label_B = torch.multinomial(target.uniform_prob, num_samples=B, generator=rng).reshape(B)
+            label_B = torch.multinomial(
+                target.uniform_prob, num_samples=B, generator=rng
+            ).reshape(B)
         elif isinstance(label_B, int):
             label_B = torch.full((B,), label_B, device=target.lvl_1L.device)
-    
-        # global indices
-        start_points = [0, 1, 5, 14, 30, 55, 91, 155, 255, 424]
-        exit_points  = [1, 5, 14, 30, 55, 91, 155, 255, 424, 680]
-        sindex, pindex = start_points[entry_num], exit_points[entry_num]
-    
-        # helper to build first token map / lvl_pos etc.
-        def _init_ctx(model):
-            sos, cond, _, lvl_pos, next_map, f_hat = self.init_param(model, B, label_B)
-            for blk in model.blocks:
-                blk.attn.kv_caching(False)
-            return sos, cond, lvl_pos, next_map, f_hat
-    
-        # ▸▸▸ 1. Draft runs until entry_num-1 ---------------------------------
-        d_sos, d_cond, d_lvl_pos, d_next_map, d_f_hat = _init_ctx(draft)
+
+        # ---------- slice 位置：上一 stage ----------
+        prev_stage   = entry_num - 1
+        slice_len    = pnums[prev_stage] ** 2
+        cum_tokens   = sum(p ** 2 for p in pnums[:prev_stage])
+        sidx, eidx   = cum_tokens, cum_tokens + slice_len
+        if verbose:
+            print(f"[TEST5] prev_stage={prev_stage}  slice={slice_len}  pos=({sidx},{eidx})")
+
+        # ---------- 工具：初始化上下文并打开 KV-cache ----------
+        def _make_ctx(model):
+            sos, cond, _, lvl_pos, nxt, f_hat = self.init_param(model, B, label_B)
+            for blk in model.blocks:            # <-- KV-cache ON
+                blk.attn.kv_caching(True)
+            return sos, cond, lvl_pos, nxt, f_hat
+
+        # ============= 1. draft 先跑到 prev_stage 末尾 =============
+        d_sos, d_cond, d_lvl, d_next, d_f = _make_ctx(draft)
         cur_L = 0
-        for si, pn in enumerate(patch_nums):
-            if si >= entry_num:
+        for si, pn in enumerate(pnums):
+            if si > prev_stage:
                 break
-            ratio = si / num_stages_minus_1
-            x = d_next_map
+            x = d_next
             for blk in draft.blocks:
                 x = blk(x=x, cond_BD=d_cond, attn_bias=None)
             logits = draft.get_logits(x, d_cond)
-            idx = sample_with_top_k_top_p_(logits, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
-            h = self.vae_quant_proxy[0].embedding(idx).transpose(1, 2).reshape(B, draft.Cvae, pn, pn)
-            d_f_hat, d_next_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(patch_nums), d_f_hat, h)
+            idx = sample_with_top_k_top_p_(logits, rng=rng, num_samples=1)[:, :, 0]
+            h   = self.vae_quant_proxy[0].embedding(idx).transpose(1, 2).reshape(B, draft.Cvae, pn, pn)
+            d_f, d_next = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(pnums), d_f, h)
+
             cur_L += pn * pn
-            if si != len(patch_nums) - 1:
-                next_pn = patch_nums[si + 1]
-                d_next_map = d_next_map.view(B, draft.Cvae, -1).transpose(1, 2)
-                d_next_map = draft.word_embed(d_next_map) + d_lvl_pos[:, cur_L : cur_L + next_pn * next_pn]
-                d_next_map = d_next_map.repeat(2, 1, 1)
-    
-        # ▸▸▸ 2. Target context -------------------------------------------------
-        t_sos, t_cond, t_lvl_pos, t_next_map0, t_f_hat = _init_ctx(target)
-        if cur_L:
-            prev_tokens = d_next_map[:, :cur_L].view(B, draft.Cvae, -1).transpose(1, 2)
-            prev_emb = target.word_embed(prev_tokens) + t_lvl_pos[:, 1 : 1 + cur_L]
-            t_next_map = torch.cat([t_next_map0, prev_emb.repeat(2, 1, 1)], dim=1)
+            if si != len(pnums) - 1:            # 预处理下一 stage 的输入
+                nxt_pn = pnums[si + 1]
+                d_next = d_next.view(B, draft.Cvae, -1).transpose(1, 2)
+                d_next = draft.word_embed(d_next) + d_lvl[:, cur_L : cur_L + nxt_pn * nxt_pn]
+                d_next = d_next.repeat(2, 1, 1)
+
+        # ============= 2. target 复用前缀，构造同样 slice ==========
+        t_sos, t_cond, t_lvl, t_next0, _ = _make_ctx(target)
+        if cur_L:                               # 把 draft 已生成的 token 嵌入 target
+            prev_tok = d_next[:, :cur_L].view(B, draft.Cvae, -1).transpose(1, 2)
+            prev_emb = target.word_embed(prev_tok) + t_lvl[:, 1 : 1 + cur_L]
+            t_next   = torch.cat([t_next0, prev_emb.repeat(2, 1, 1)], dim=1)
         else:
-            t_next_map = t_next_map0
-    
-        # ▸▸▸ 3. Same slice → compare logits -----------------------------------
-        slice_tokens = t_next_map[:, sindex:pindex]
-        #   draft logits
-        x = slice_tokens.clone()
-        for blk in draft.blocks:
-            x = blk(x=x, cond_BD=d_cond, attn_bias=None)
-        d_logits = draft.get_logits(x, d_cond)
-        #   target logits
-        x = slice_tokens.clone()
-        for blk in target.blocks:
-            x = blk(x=x, cond_BD=t_cond, attn_bias=None)
-        t_logits = target.get_logits(x, t_cond)
-    
-        t_entry = cfg * (entry_num / num_stages_minus_1)
-        d_logits = (1 + t_entry) * d_logits[:B] - t_entry * d_logits[B:]
-        t_logits = (1 + t_entry) * t_logits[:B] - t_entry * t_logits[B:]
-    
-        if d_logits.shape != t_logits.shape:
-            print(f"[TEST5][SHAPE] draft {d_logits.shape} vs target {t_logits.shape}")
-        diff = (t_logits - d_logits).abs().max().item()
-        print(f"[TEST5][COMPARE] entry_num={entry_num} — max|Δlogits| = {diff:.6f}")
-    
-        # ▸▸▸ 4. Return draft image -------------------------------------------
-        return self.vae_proxy[0].fhat_to_img(d_f_hat).add_(1).mul_(0.5)  # (B,3,H,W)
-    
+            t_next = t_next0
+
+        slice_tok = t_next[:, sidx:eidx]        # (2B, slice_len, C)
+        if verbose:
+            print("[TEST5] slice_tok shape:", slice_tok.shape)
+
+        # ---------- 计算 logits ----------
+        def _forward_slice(model, cond):
+            x = slice_tok.clone()
+            for blk in model.blocks:
+                x = blk(x=x, cond_BD=cond, attn_bias=None)
+            return model.get_logits(x, cond)[:B]   # 只拿前 B，去掉 CFG 翻倍
+
+        lg_d = _forward_slice(draft,  d_cond)
+        lg_t = _forward_slice(target, t_cond)
+
+        # ---------- 对齐 CFG 缩放并比较 ----------
+        ratio  = cfg * (entry_num / num_stage_m1)
+        scale  = 1 + ratio
+        maxdiff = (scale * lg_t - scale * lg_d).abs().max().item()
+        print(f"[TEST5][COMPARE] entry_num={entry_num}  max|Δlogits| = {maxdiff:.6f}")
+
+        # ---------- 关闭 KV-cache ----------
+        for m in (draft, target):
+            for blk in m.blocks:
+                blk.attn.kv_caching(False)
+
+        # 返回 draft 图像，方便肉眼对比
+        return self.vae_proxy[0].fhat_to_img(d_f).add_(1).mul_(0.5)
 
 
     def get_t_per_token(patch_nums, cfg, device=None):
