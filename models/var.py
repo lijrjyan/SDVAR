@@ -1336,8 +1336,12 @@ class SDVAR(nn.Module):
             target_logits_BlV = (1+t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
     
             if si == entry_num:
-                diff = (target_logits_BlV - draft_logits_ref).abs().max().item()
-                print(f"[TEST5][COMPARE] Max diff between draft and target logits at entry_num={entry_num}: {diff:.6f}")
+                if draft_logits_ref is None:
+                    print(f"[TEST5][WARN] No draft logits recorded at entry_num={entry_num}, skipping comparison.")
+                else:
+                    diff = (target_logits_BlV - draft_logits_ref).abs().max().item()
+                    print(f"[TEST5][COMPARE] Max diff between draft and target logits at entry_num={entry_num}: {diff:.6f}")
+
     
             target_idx_Bl = sample_with_top_k_top_p_(
                 target_logits_BlV,
