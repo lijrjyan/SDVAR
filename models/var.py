@@ -1071,6 +1071,252 @@ class SDVAR(nn.Module):
 
         # return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
 # '''
+        @torch.no_grad()More actions
+    def sdvar_autoregressive_infer_cfg_sd_test4(
+        self,
+        B: int,
+        label_B: Optional[Union[int, torch.LongTensor]],
+        g_seed: Optional[int] = None,
+        cfg: float = 1.5,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        more_smooth: bool = False,
+        entry_num: int = 5,
+    ) -> torch.Tensor:
+        """
+        修复版SDVAR推理函数，解决不同entry_num导致的随机数同步问题
+        
+        主要改进：
+        1. 为draft和target模型创建分离的随机数生成器
+        2. 确保target模型始终从相同的随机数状态开始生成
+        3. 保证相同模型和初始化下，无论entry_num如何，最终输出保持一致
+        
+        :param B: batch size
+        :param label_B: imagenet label; if None, randomly sampled
+        :param g_seed: random seed
+        :param cfg: classifier-free guidance ratio
+        :param top_k: top-k sampling
+        :param top_p: top-p sampling
+        :param more_smooth: smoothing the pred using gumbel softmax
+        :param entry_num: 模型切换点，draft_model生成前entry_num个阶段
+        :return: reconstructed image (B, 3, H, W) in [0, 1]
+        """
+        # === 修复1: 创建分离的随机数生成器 ===
+        if g_seed is not None:
+            # 为draft模型创建专用的随机数生成器
+            draft_rng = torch.Generator(device=self.draft_model.lvl_1L.device)
+            draft_rng.manual_seed(g_seed)
+            
+            # 为target模型创建专用的随机数生成器，使用相同种子
+            target_rng = torch.Generator(device=self.target_model.lvl_1L.device) 
+            target_rng.manual_seed(g_seed)
+            
+            # label生成使用target的随机数生成器
+            label_rng = target_rng
+        else:
+            draft_rng = None
+            target_rng = None
+            label_rng = None
+
+        # 验证模型兼容性
+        assert self.draft_model.patch_nums == self.target_model.patch_nums
+        assert self.draft_model.num_stages_minus_1 == self.target_model.num_stages_minus_1
+        patch_nums = self.draft_model.patch_nums
+        total_stages = len(patch_nums)
+        
+        # 处理标签
+        if label_B is None:
+            label_B = torch.multinomial(
+                self.target_model.uniform_prob, 
+                num_samples=B, 
+                replacement=True, 
+                generator=label_rng
+            ).reshape(B)
+        elif isinstance(label_B, int):
+            label_B = torch.full(
+                (B,),
+                fill_value=self.target_model.num_classes if label_B < 0 else label_B,
+                device=self.target_model.lvl_1L.device
+            )
+
+        # === 阶段1: Draft模型生成前entry_num个阶段 ===
+        # 初始化draft模型参数
+        draft_sos = draft_cond_BD = self.draft_model.class_emb(
+            torch.cat((label_B, torch.full_like(label_B, fill_value=self.draft_model.num_classes)), dim=0)
+        )
+        draft_lvl_pos = self.draft_model.lvl_embed(self.draft_model.lvl_1L) + self.draft_model.pos_1LC
+        draft_next_token_map = (
+            draft_sos.unsqueeze(1).expand(2*B, self.draft_model.first_l, -1)
+            + self.draft_model.pos_start.expand(2*B, self.draft_model.first_l, -1)
+            + draft_lvl_pos[:, :self.draft_model.first_l]
+        )
+        draft_f_hat = draft_sos.new_zeros(B, self.draft_model.Cvae, patch_nums[-1], patch_nums[-1])
+        draft_cur_L = 0
+        draft_token_hub = []
+
+        # 启用draft模型的KV缓存
+        for blk in self.draft_model.blocks:
+            blk.attn.kv_caching(True)
+
+        # Draft模型生成
+        for si in range(min(entry_num, total_stages)):
+            pn = patch_nums[si]
+            ratio = si / self.draft_model.num_stages_minus_1 if self.draft_model.num_stages_minus_1 > 0 else 0
+            draft_cur_L += pn * pn
+
+            # 前向传播
+            draft_cond_BD_or_gss = self.draft_model.shared_ada_lin(draft_cond_BD)
+            x = draft_next_token_map
+            for blk in self.draft_model.blocks:
+                x = blk(x=x, cond_BD=draft_cond_BD_or_gss, attn_bias=None)
+            draft_logits_BlV = self.draft_model.get_logits(x, draft_cond_BD)
+
+            # CFG处理
+            t = cfg * ratio
+            draft_logits_BlV = (1 + t) * draft_logits_BlV[:B] - t * draft_logits_BlV[B:]
+
+            # === 修复2: 使用draft专用随机数生成器 ===
+            draft_idx_Bl = sample_with_top_k_top_p_(
+                draft_logits_BlV,
+                rng=draft_rng,  # 使用draft专用RNG
+                top_k=top_k,
+                top_p=top_p,
+                num_samples=1
+            )[:, :, 0]
+
+            # 获取embedding
+            if not more_smooth:
+                draft_h_BChw = self.draft_model.vae_quant_proxy[0].embedding(draft_idx_Bl)
+            else:
+                draft_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                draft_h_BChw = gumbel_softmax_with_rng(
+                    draft_logits_BlV.mul(1 + ratio), 
+                    tau=draft_gum_t, 
+                    hard=False, 
+                    dim=-1, 
+                    rng=draft_rng  # 使用draft专用RNG
+                ) @ self.draft_model.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+            draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+
+            # 更新状态
+            draft_f_hat, draft_next_token_map = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, total_stages, draft_f_hat, draft_h_BChw
+            )
+
+            # 准备下一阶段
+            if si != total_stages - 1:
+                next_pn = patch_nums[si + 1]
+                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
+                draft_token_hub.append(draft_next_token_map.clone())
+                draft_next_token_map = (
+                    self.draft_model.word_embed(draft_next_token_map)
+                    + draft_lvl_pos[:, draft_cur_L:draft_cur_L + next_pn * next_pn]
+                )
+                draft_next_token_map = draft_next_token_map.repeat(2, 1, 1)
+
+        # 关闭draft模型的KV缓存
+        for blk in self.draft_model.blocks:
+            blk.attn.kv_caching(False)
+
+        # 如果draft模型已经生成完所有阶段
+        if entry_num >= total_stages:
+            return self.draft_model.vae_proxy[0].fhat_to_img(draft_f_hat).add_(1).mul_(0.5)
+
+        # === 阶段2: Target模型接管并生成剩余阶段 ===
+        # 初始化target模型参数
+        target_sos = target_cond_BD = self.target_model.class_emb(
+            torch.cat((label_B, torch.full_like(label_B, fill_value=self.target_model.num_classes)), dim=0)
+        )
+        target_lvl_pos = self.target_model.lvl_embed(self.target_model.lvl_1L) + self.target_model.pos_1LC
+        target_first_token_map = (
+            target_sos.unsqueeze(1).expand(2*B, self.target_model.first_l, -1)
+            + self.target_model.pos_start.expand(2*B, self.target_model.first_l, -1)
+            + target_lvl_pos[:, :self.target_model.first_l]
+        )
+
+        # 继承draft模型的状态
+        target_f_hat = draft_f_hat.clone()
+        
+        # 构建target模型的token map
+        if len(draft_token_hub) > 0:
+            # 连接draft生成的tokens
+            draft_tokens = torch.cat(draft_token_hub, dim=1)
+            target_next_token_map = self.target_model.word_embed(draft_tokens) + target_lvl_pos[:, self.target_model.first_l:draft_cur_L]
+            target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+            target_next_token_map = torch.cat([target_first_token_map, target_next_token_map], dim=1)
+        else:
+            target_next_token_map = target_first_token_map
+
+        # 启用target模型的KV缓存
+        for blk in self.target_model.blocks:
+            blk.attn.kv_caching(True)
+
+        target_cur_L = draft_cur_L
+
+        # Target模型生成剩余阶段
+        for si in range(entry_num, total_stages):
+            pn = patch_nums[si]
+            ratio = si / self.target_model.num_stages_minus_1 if self.target_model.num_stages_minus_1 > 0 else 0
+            target_cur_L += pn * pn
+
+            # 前向传播
+            target_cond_BD_or_gss = self.target_model.shared_ada_lin(target_cond_BD)
+            x = target_next_token_map
+            for blk in self.target_model.blocks:
+                x = blk(x=x, cond_BD=target_cond_BD_or_gss, attn_bias=None)
+            target_logits_BlV = self.target_model.get_logits(x, target_cond_BD)
+
+            # CFG处理
+            t = cfg * ratio
+            target_logits_BlV = (1 + t) * target_logits_BlV[:B] - t * target_logits_BlV[B:]
+
+            # === 修复3: 使用target专用随机数生成器 ===
+            target_idx_Bl = sample_with_top_k_top_p_(
+                target_logits_BlV,
+                rng=target_rng,  # 使用target专用RNG，保证一致性
+                top_k=top_k,
+                top_p=top_p,
+                num_samples=1
+            )[:, :, 0]
+
+            # 获取embedding
+            if not more_smooth:
+                target_h_BChw = self.target_model.vae_quant_proxy[0].embedding(target_idx_Bl)
+            else:
+                target_gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                target_h_BChw = gumbel_softmax_with_rng(
+                    target_logits_BlV.mul(1 + ratio),
+                    tau=target_gum_t,
+                    hard=False,
+                    dim=-1,
+                    rng=target_rng  # 使用target专用RNG
+                ) @ self.target_model.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+            target_h_BChw = target_h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)
+
+            # 更新状态
+            target_f_hat, target_next_token_map = self.target_model.vae_quant_proxy[0].get_next_autoregressive_input(
+                si, total_stages, target_f_hat, target_h_BChw
+            )
+
+            # 准备下一阶段
+            if si != total_stages - 1:
+                next_pn = patch_nums[si + 1]
+                target_next_token_map = target_next_token_map.view(B, self.target_model.Cvae, -1).transpose(1, 2)
+                target_next_token_map = (
+                    self.target_model.word_embed(target_next_token_map)
+                    + target_lvl_pos[:, target_cur_L:target_cur_L + next_pn * next_pn]
+                )
+                target_next_token_map = target_next_token_map.repeat(2, 1, 1)
+
+        # 关闭target模型的KV缓存
+        for blk in self.target_model.blocks:
+            blk.attn.kv_caching(False)
+
+        # 返回最终图像
+        return self.target_model.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)
+
     def get_t_per_token(patch_nums, cfg, device=None):
         num_stages_minus_1 = len(patch_nums) - 1
         t_per_token = []
