@@ -5,6 +5,13 @@ from .quant import VectorQuantizer2
 from .var import VAR, SDVAR
 from .vqvae import VQVAE
 
+__all__ = [
+    'VQVAE',
+    'VAR',
+    'SDVAR',
+    'build_vae_var',
+    'build_vae_var_speculative_decoding',
+]
 
 def build_vae_var(
     # Shared args
