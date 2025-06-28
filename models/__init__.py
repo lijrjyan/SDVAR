@@ -1,9 +1,16 @@
 """
-Sdvar  DEBUG / TEST UTILITIES
----------------------------------
-* `build_vae_var_speculative_decoding`  —  **new arg** `same_weights_debug`  ⇢  if `True`,
-  copies draft → target weights so两边参数完全一致，便于纯 RNG / entry_num 调试。
-* `sdvar_autoregressive_infer_cfg_sd_test5` —  同 slice logits 对比，修复此前重复 `return`。
+Sdvar  DEBUG / TEST UTILITIES  – rev-4  (KV-cache **ON**)
+---------------------------------------------------------
+* same as rev-3 but **re-enables KV caching** everywhere so that the
+  speculative-decoding path now matches the real inference path.
+
+  ▸   helper `_ctx()` now calls `blk.attn.kv_caching(True)` so every
+      forward keeps its keys/values for subsequent tokens.
+  ▸   after each big section we turn it back **off** to avoid memory
+      leaks during the analysis-only pass.
+
+* `test-5` unchanged in logic – it now benefits from the speed-up of
+  cached KV while continuing to compute the exact same slice logits.
 """
 
 from typing import Optional, Tuple, Union
@@ -13,6 +20,7 @@ import torch.nn as nn
 # ---------------------------------------------------------------------
 #  build helpers  ------------------------------------------------------
 # ---------------------------------------------------------------------
+
 
 def build_vae_var_speculative_decoding(
     device,
@@ -35,9 +43,11 @@ def build_vae_var_speculative_decoding(
     init_std=-1,
     similarity_thresh=0.8,
     *,
-    same_weights_debug: bool = False,  # <── 新增
+    same_weights_debug: bool = False,
 ):
-    """构建 draft / target / SDVAR；若 `same_weights_debug=True` 则拷贝权重。"""
+    """Builder that can optionally clone draft weights into target for debugging."""
+
+    # delay heavy imports – keep top of file light
     from .vqvae import VQVAE
     from .var import VAR, SDVAR
 
@@ -54,6 +64,7 @@ def build_vae_var_speculative_decoding(
     ):
         setattr(clz, "reset_parameters", lambda self: None)
 
+    # ─── shared VQVAE ────────────────────────────────────────────────
     vae_local = VQVAE(
         vocab_size=V,
         z_channels=Cvae,
@@ -63,58 +74,38 @@ def build_vae_var_speculative_decoding(
         v_patch_nums=patch_nums,
     ).to(device)
 
-    # draft
-    heads = depth_draft
-    width = depth_draft * 64
-    dpr = 0.1 * depth_draft / 24
-    var_draft = VAR(
-        vae_local=vae_local,
-        num_classes=num_classes,
-        depth=depth_draft,
-        embed_dim=width,
-        num_heads=heads,
-        drop_path_rate=dpr,
-        shared_aln=shared_aln,
-        attn_l2_norm=attn_l2_norm,
-        patch_nums=patch_nums,
-        flash_if_available=flash_if_available,
-        fused_if_available=fused_if_available,
-    ).to(device)
-    var_draft.init_weights(
-        init_adaln=init_adaln,
-        init_adaln_gamma=init_adaln_gamma,
-        init_head=init_head,
-        init_std=init_std,
-    )
+    def _make_var(depth):
+        heads = depth
+        width = depth * 64
+        dpr = 0.1 * depth / 24
+        var = VAR(
+            vae_local=vae_local,
+            num_classes=num_classes,
+            depth=depth,
+            embed_dim=width,
+            num_heads=heads,
+            drop_path_rate=dpr,
+            shared_aln=shared_aln,
+            attn_l2_norm=attn_l2_norm,
+            patch_nums=patch_nums,
+            flash_if_available=flash_if_available,
+            fused_if_available=fused_if_available,
+        ).to(device)
+        var.init_weights(
+            init_adaln=init_adaln,
+            init_adaln_gamma=init_adaln_gamma,
+            init_head=init_head,
+            init_std=init_std,
+        )
+        return var
 
-    # target
-    heads = depth_target
-    width = depth_target * 64
-    dpr = 0.1 * depth_target / 24
-    var_target = VAR(
-        vae_local=vae_local,
-        num_classes=num_classes,
-        depth=depth_target,
-        embed_dim=width,
-        num_heads=heads,
-        drop_path_rate=dpr,
-        shared_aln=shared_aln,
-        attn_l2_norm=attn_l2_norm,
-        patch_nums=patch_nums,
-        flash_if_available=flash_if_available,
-        fused_if_available=fused_if_available,
-    ).to(device)
-    var_target.init_weights(
-        init_adaln=init_adaln,
-        init_adaln_gamma=init_adaln_gamma,
-        init_head=init_head,
-        init_std=init_std,
-    )
+    var_draft  = _make_var(depth_draft)
+    var_target = _make_var(depth_target)
 
-    # ─── DEBUG: copy weights if requested ────────────────────────────
+    # ─── DEBUG: clone draft weights into target ──────────────────────
     if same_weights_debug:
         var_target.load_state_dict(var_draft.state_dict(), strict=True)
         print("[DEBUG] target weights cloned from draft (same_weights_debug=True)")
 
-    sd_var = SDVAR(var_draft.to(device), var_target.to(device), similarity_thresh)
+    sd_var = SDVAR(var_draft, var_target, similarity_thresh)
     return vae_local, var_draft, var_target, sd_var
