@@ -57,3 +57,19 @@ class DropPath(nn.Module):  # taken from timm
     
     def extra_repr(self):
         return f'(drop_prob=...)'
+
+def sample_with_debug_log(logits_BlV: torch.Tensor, top_k: int = 0, top_p: float = 0.0, rng=None, num_samples=1, label: str = "") -> torch.Tensor:
+    """
+    Debug wrapper for sample_with_top_k_top_p_, logs RNG state before sampling.
+    Use this only during debugging. Remove or disable after confirming reproducibility.
+    """
+    if rng is not None:
+        try:
+            state_sum = rng.get_state().sum().item()
+            print(f"[DEBUG][{label}] RNG state hash before sampling: {hash(state_sum)}")
+        except Exception as e:
+            print(f"[DEBUG][{label}] RNG state error: {e}")
+    else:
+        print(f"[DEBUG][{label}] RNG is None")
+
+    return sample_with_top_k_top_p_(logits_BlV, top_k=top_k, top_p=top_p, rng=rng, num_samples=num_samples)
