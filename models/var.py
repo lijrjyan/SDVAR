@@ -662,7 +662,8 @@ class SDVAR(nn.Module):
         draft_token_hub = []
         
         for blk in self.draft_model.blocks:
-            blk.attn.kv_caching(True)
+            # blk.attn.kv_caching(True)
+            blk.attn.kv_caching(False)
 
         for si, pn in enumerate(self.patch_nums):
             
@@ -760,7 +761,8 @@ class SDVAR(nn.Module):
             target_next_token_map = target_first_token_map
         
         for blk in self.target_model.blocks:
-            blk.attn.kv_caching(True)
+            # blk.attn.kv_caching(True)
+            blk.attn.kv_caching(False)
 
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
