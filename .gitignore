@@ -21,6 +21,7 @@ local_output*
 VAR_paper/
 proposal.md
 CoDe-master/
+todo.md
 
 # SDVAR项目文档和计划 (避免被git保存)
 SDVAR_Implementation_Plan.md
