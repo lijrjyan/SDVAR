@@ -435,7 +435,7 @@ class VAR(nn.Module):
 
         for block in self.blocks: block.attn.kv_caching(False)
 
-        # return input_token_history, f_hat_history, logits_history, token_id_history, next_token_map, f_hat
+        # return input_token_history, f_hat_history, logits_history, token_id_history
         # input_token_history: current_step -> current_step + step, len = step + 1
         # f_hat_history: current_step -> current_step + step, len = step + 1
         # logits_history: current_step -> current_step + step - 1, len = step
@@ -1157,6 +1157,130 @@ class SDVAR(nn.Module):
         mask = torch.triu(torch.full((mask_length, mask_length), float('-inf')), diagonal=1)
         return mask.unsqueeze(0).unsqueeze(0)  # 添加batch和head维度
 
+    def basic_token_matching(self, draft_tokens: List[torch.Tensor], 
+                           target_logits: List[torch.Tensor], state, B: int) -> int:
+        """
+        基础token匹配验证逻辑 - Week 1简化版本
+        
+        比较draft生成的tokens与target logits，决定接受多少层
+        使用简单的top-1匹配策略：如果draft token是target logits的top-1，则接受
+        
+        :param draft_tokens: draft模型生成的tokens，每层一个tensor
+        :param target_logits: target模型对应的logits，每层一个tensor  
+        :param state: 推理状态
+        :param B: batch size
+        :return: 接受的层数
+        """
+        if not draft_tokens or not target_logits:
+            return 0
+        
+        if len(draft_tokens) != len(target_logits):
+            print(f"[SDVAR] Mismatch: {len(draft_tokens)} draft vs {len(target_logits)} target")
+            return 0
+        
+        gamma = len(draft_tokens)
+        print(f"[SDVAR] Starting basic token matching for {gamma} stages")
+        
+        accepted_stages = 0
+        total_tokens = 0
+        matched_tokens = 0
+        
+        # 逐层进行匹配验证
+        for stage_idx in range(gamma):
+            current_stage = state.current_stage + stage_idx
+            pn = state.patch_nums[current_stage]
+            
+            draft_stage_tokens = draft_tokens[stage_idx]  # B, pn*pn
+            target_stage_logits = target_logits[stage_idx]  # B, pn*pn, V
+            
+            print(f"[SDVAR] Matching stage {current_stage}: draft_tokens shape {draft_stage_tokens.shape}, target_logits shape {target_stage_logits.shape}")
+            
+            # 获取target的top-1预测
+            target_top1 = torch.argmax(target_stage_logits, dim=-1)  # B, pn*pn
+            
+            # 比较draft tokens和target top-1
+            stage_matches = (draft_stage_tokens == target_top1)  # B, pn*pn
+            stage_match_rate = stage_matches.float().mean().item()
+            
+            stage_total = draft_stage_tokens.numel()
+            stage_matched = stage_matches.sum().item()
+            
+            total_tokens += stage_total
+            matched_tokens += stage_matched
+            
+            print(f"[SDVAR] Stage {current_stage} match rate: {stage_match_rate:.3f} ({stage_matched}/{stage_total})")
+            
+            # 基础匹配策略：如果匹配率 >= 阈值，接受这一层
+            # Week 1使用简单的层级匹配阈值
+            match_threshold = 0.5  # 50%匹配率阈值
+            
+            if stage_match_rate >= match_threshold:
+                accepted_stages += 1
+                print(f"[SDVAR] ✅ Accepting stage {current_stage} (match rate: {stage_match_rate:.3f})")
+            else:
+                print(f"[SDVAR] ❌ Rejecting stage {current_stage} and all subsequent stages (match rate: {stage_match_rate:.3f})")
+                break  # 一旦有层被拒绝，后续层也全部拒绝（保持因果性）
+        
+        overall_match_rate = matched_tokens / total_tokens if total_tokens > 0 else 0.0
+        print(f"[SDVAR] Basic matching completed: accepted {accepted_stages}/{gamma} stages, overall match rate: {overall_match_rate:.3f}")
+        
+        return accepted_stages
+
+    def advanced_token_matching(self, draft_tokens: List[torch.Tensor], 
+                               target_logits: List[torch.Tensor], state, B: int) -> int:
+        """
+        高级token匹配验证逻辑 - 为Week 2准备
+        
+        将支持更复杂的匹配策略：
+        - 概率分布KL散度比较
+        - top-k匹配而非仅top-1
+        - 动态阈值调整
+        - 部分接受（token级回滚）
+        
+        目前返回基础匹配结果
+        """
+        # TODO: Week 2实现高级匹配逻辑
+        return self.basic_token_matching(draft_tokens, target_logits, state, B)
+
+    def update_state_with_accepted_tokens(self, draft_tokens: List[torch.Tensor], 
+                                        accept_length: int, state, B: int):
+        """
+        更新推理状态，处理被接受的tokens
+        
+        将接受的tokens更新到f_hat中，准备下一轮推理
+        """
+        if accept_length <= 0:
+            return
+        
+        print(f"[SDVAR] Updating state with {accept_length} accepted stages")
+        
+        # 处理接受的每一层
+        current_f_hat = state.draft_f_hat
+        
+        for stage_idx in range(accept_length):
+            current_stage = state.current_stage + stage_idx
+            pn = state.patch_nums[current_stage]
+            
+            # 获取这一层的tokens
+            stage_tokens = draft_tokens[stage_idx]
+            
+            # 转换为embedding并reshape
+            h_BChw = self.draft_model.vae_quant_proxy[0].embedding(stage_tokens)
+            h_BChw = h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+            
+            # 更新f_hat
+            current_f_hat, _ = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
+                current_stage, state.total_stages, current_f_hat, h_BChw
+            )
+            
+            print(f"[SDVAR] Updated f_hat for stage {current_stage}")
+        
+        # 更新状态中的f_hat
+        state.draft_f_hat = current_f_hat
+        state.target_f_hat = current_f_hat.clone()  # target也同步
+        
+        print(f"[SDVAR] State update completed for {accept_length} stages")
+
     @torch.no_grad()
     def sdvar_autoregressive_infer_cfg_parallel_v1(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]] = None,
@@ -1206,24 +1330,47 @@ class SDVAR(nn.Module):
             # 2. Target批量验证 (Week 1新增功能)
             target_logits, verified_gamma = self.target_verify_batch(draft_tokens, state, B)
             
-            # 3. 基础匹配验证 (Week 1简化版本)
-            # TODO: Week 2将实现更复杂的token级匹配
-            if target_logits:
-                accept_length = verified_gamma  # 暂时全接受
-                print(f"[SDVAR] Basic matching: accepting all {accept_length} stages")
+            # 3. 基础匹配验证 - 集成真正的token匹配逻辑
+            if target_logits and len(target_logits) > 0:
+                accept_length = self.basic_token_matching(draft_tokens, target_logits, state, B)
+                print(f"[SDVAR] Token matching result: accepting {accept_length}/{verified_gamma} stages")
             else:
                 accept_length = 0
                 print(f"[SDVAR] Target verification failed, rejecting all")
             
-            # 4. 提交接受的部分
+            # 4. 更新推理状态
+            if accept_length > 0:
+                self.update_state_with_accepted_tokens(draft_tokens, accept_length, state, B)
+                print(f"[SDVAR] Successfully processed {accept_length} stages")
+            else:
+                print(f"[SDVAR] No stages accepted, will retry with smaller gamma")
+            
+            # 5. 提交接受的部分
             state.accept_count += accept_length
             state.current_stage += accept_length
             
-            # 5. 如果没有进展，退化到单层生成（安全机制）
+            # 6. 动态gamma调整策略
             if accept_length == 0:
-                state.gamma = 1
-                print(f"[SDVAR] Fallback to gamma=1 at stage {state.current_stage}")
-        
+                # 如果没有接受任何stage，降低gamma重试
+                if state.gamma > 1:
+                    state.gamma = max(1, state.gamma - 1)
+                    print(f"[SDVAR] Reducing gamma to {state.gamma} due to rejection")
+                else:
+                    # gamma=1还是失败，强制接受一层避免死循环
+                    print(f"[SDVAR] Emergency fallback: force accepting 1 stage at {state.current_stage}")
+                    if draft_tokens:
+                        self.update_state_with_accepted_tokens(draft_tokens[:1], 1, state, B)
+                        state.accept_count += 1
+                        state.current_stage += 1
+            elif accept_length == verified_gamma:
+                # 如果全部接受，可以考虑增加gamma（但Week 1保持固定）
+                print(f"[SDVAR] All stages accepted, maintaining gamma={state.gamma}")
+            
+            # 7. 检查是否有进展
+            if accept_length == 0 and state.gamma == 1:
+                print(f"[SDVAR] No progress possible, stopping inference")
+                break
+
         # 清理KV cache
         for blk in self.draft_model.blocks:
             blk.attn.kv_caching(False)
