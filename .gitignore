@@ -18,3 +18,22 @@ local_output*
 *.log
 *.txt
 *.ipynb
+VAR_paper/
+proposal.md
+CoDe-master/
+
+# SDVAR项目文档和计划 (避免被git保存)
+SDVAR_Implementation_Plan.md
+Week*_Implementation_Guide.md
+docs/
+*_plan.md
+*_guide.md
+implementation_*.md
+progress_*.md
+
+# 测试和临时文件
+tests/
+benchmarks/
+tmp_*
+temp_*
+scratch_*
