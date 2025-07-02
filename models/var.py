@@ -701,7 +701,7 @@ class SDVAR(nn.Module):
                     draft_logits_BlV.mul(1 + ratio), tau=draft_gum_t, hard=False, dim=-1, rng=self.rng
                     ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
             
-            draft_h_BChw = draft_h_BChw.transpose(1,2).reshape(B, self.draft_model.Cvae, pn, pn)
+            draft_h_BChw = draft_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
 
             draft_f_hat, draft_next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(
                 si, total_stages, draft_f_hat, draft_h_BChw
@@ -709,7 +709,7 @@ class SDVAR(nn.Module):
 
             if si != self.num_stages_minus_1:   # prepare for next stage
                 next_pn = self.patch_nums[si+1]
-                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1,2)
+                draft_next_token_map = draft_next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
                 draft_token_hub.append(draft_next_token_map)
                 draft_next_token_map = (
                     self.draft_model.word_embed(draft_next_token_map)
@@ -1023,6 +1023,140 @@ class SDVAR(nn.Module):
         
         return draft_tokens
 
+    def target_verify_batch(self, draft_tokens: List[torch.Tensor], 
+                           state, B: int) -> Tuple[List[torch.Tensor], int]:
+        """target模型批量验证draft生成的tokens"""
+        if not draft_tokens:
+            return [], 0
+        
+        gamma = len(draft_tokens)
+        print(f"[SDVAR] Target verifying batch: gamma={gamma}, current_stage={state.current_stage}")
+        
+        # 构建联合查询序列
+        combined_query = self._build_combined_query(draft_tokens, state, B)
+        print(f"[SDVAR] Combined query shape: {combined_query.shape}")
+        
+        # 计算适当的注意力掩码
+        mask_length = combined_query.shape[1]
+        attn_bias = self._get_attention_mask(mask_length, state.current_stage, gamma)
+        
+        # 确保KV cache开启
+        for blk in self.target_model.blocks:
+            blk.attn.kv_caching(True)
+        
+        # target前向计算
+        state.target_calls += 1  # 统计调用次数
+        print(f"[SDVAR] Target forward call #{state.target_calls}")
+        
+        x = combined_query
+        for blk in self.target_model.blocks:
+            x = blk(x=x, cond_BD=state.target_cond_BD, attn_bias=attn_bias)
+        
+        target_logits = self.target_model.get_logits(x, state.target_cond_BD)
+        
+        # 分割logits回对应的层
+        logits_per_stage = self._split_logits_by_stage(target_logits, draft_tokens, B, state)
+        
+        # 应用CFG
+        cfg_logits = []
+        for stage_idx, stage_logits in enumerate(logits_per_stage):
+            current_stage = state.current_stage + stage_idx
+            ratio = current_stage / self.target_model.num_stages_minus_1
+            t = state.cfg * ratio
+            cfg_stage_logits = (1 + t) * stage_logits[:B] - t * stage_logits[B:]
+            cfg_logits.append(cfg_stage_logits)
+        
+        print(f"[SDVAR] Target verification completed, generated {len(cfg_logits)} stage logits")
+        return cfg_logits, gamma
+
+    def _build_combined_query(self, draft_tokens: List[torch.Tensor], 
+                             state, B: int) -> torch.Tensor:
+        """将多层draft tokens组合成target的查询序列"""
+        print(f"[SDVAR] Building combined query for {len(draft_tokens)} stages")
+        
+        # 将draft tokens转换为embeddings并拼接
+        token_embeddings = []
+        
+        for stage_idx, tokens in enumerate(draft_tokens):
+            current_stage = state.current_stage + stage_idx
+            pn = state.patch_nums[current_stage]
+            
+            print(f"[SDVAR] Processing stage {current_stage}, tokens shape: {tokens.shape}, pn={pn}")
+            
+            # 获取embedding
+            h_BChw = self.target_model.vae_quant_proxy[0].embedding(tokens)
+            h_embed = h_BChw.transpose(1, 2)  # B, pn*pn, C
+            
+            # 添加位置编码
+            start_pos = sum(p**2 for p in state.patch_nums[:current_stage])
+            end_pos = start_pos + pn * pn
+            pos_embed = state.target_lvl_pos[:, start_pos:end_pos]
+            
+            # 应用word embedding和位置编码
+            h_embed = self.target_model.word_embed(h_embed) + pos_embed
+            token_embeddings.append(h_embed)
+            
+            print(f"[SDVAR] Stage {current_stage} embedding shape: {h_embed.shape}")
+        
+        # 拼接所有层的embeddings
+        combined = torch.cat(token_embeddings, dim=1)  # B, total_tokens, C
+        print(f"[SDVAR] Combined embeddings shape: {combined.shape}")
+        
+        # CFG doubling
+        combined = combined.repeat(2, 1, 1)
+        
+        # 与之前已接受的tokens拼接（如果有的话）
+        if state.current_stage > 0 and hasattr(state, 'accepted_token_embeddings'):
+            prefix_tokens = state.accepted_token_embeddings
+            combined = torch.cat([prefix_tokens, combined], dim=1)
+            print(f"[SDVAR] Added prefix tokens, final shape: {combined.shape}")
+        
+        return combined
+
+    def _split_logits_by_stage(self, target_logits: torch.Tensor, 
+                              draft_tokens: List[torch.Tensor], B: int, state) -> List[torch.Tensor]:
+        """将target的logits分割回对应的层"""
+        print(f"[SDVAR] Splitting logits: input shape {target_logits.shape}")
+        
+        logits_per_stage = []
+        current_pos = 0
+        
+        # 如果有前缀tokens，先跳过它们
+        if state.current_stage > 0:
+            prefix_length = sum(p**2 for p in state.patch_nums[:state.current_stage])
+            current_pos = prefix_length
+            print(f"[SDVAR] Skipping prefix tokens: {prefix_length}")
+        
+        # 分割每个stage的logits
+        for stage_idx, tokens in enumerate(draft_tokens):
+            current_stage = state.current_stage + stage_idx
+            pn = state.patch_nums[current_stage]
+            stage_length = pn * pn
+            
+            # 提取这个stage的logits
+            stage_logits = target_logits[:, current_pos:current_pos + stage_length, :]
+            logits_per_stage.append(stage_logits)
+            current_pos += stage_length
+            
+            print(f"[SDVAR] Stage {current_stage} logits shape: {stage_logits.shape}")
+        
+        return logits_per_stage
+
+    def _get_attention_mask(self, mask_length: int, current_stage: int, gamma: int) -> torch.Tensor:
+        """获取适当的注意力掩码用于target批量验证"""
+        # 对于Week 1的简化版本，暂时使用基础的因果掩码
+        # TODO: Week 2将实现更复杂的块级掩码策略
+        
+        if hasattr(self.target_model, 'attn_bias_for_masking'):
+            # 使用预计算的因果掩码
+            full_mask = self.target_model.attn_bias_for_masking
+            if mask_length <= full_mask.shape[-1]:
+                return full_mask[:, :, :mask_length, :mask_length]
+        
+        # 如果没有预计算的掩码，创建简单的因果掩码
+        mask = torch.triu(torch.full((mask_length, mask_length), float('-inf')), diagonal=1)
+        return mask.unsqueeze(0).unsqueeze(0)  # 添加batch和head维度
+
     @torch.no_grad()
     def sdvar_autoregressive_infer_cfg_parallel_v1(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]] = None,
@@ -1052,7 +1186,6 @@ class SDVAR(nn.Module):
         
         # 初始化状态
         state = self._initialize_inference_state(B, label_B, g_seed, cfg, gamma)
-        # 设置采样参数
         state.top_k = top_k
         state.top_p = top_p
         state.more_smooth = more_smooth
@@ -1070,16 +1203,23 @@ class SDVAR(nn.Module):
             actual_gamma = len(draft_tokens)
             print(f"[SDVAR] Draft generated {actual_gamma} stages")
             
-            # 2. 暂时使用简单的全接受策略 (Week 1基础版本)
-            # TODO: Week 2将实现真正的target验证和匹配逻辑
-            accept_length = actual_gamma
-            print(f"[SDVAR] Accepting all {accept_length} stages (simplified for Week 1)")
+            # 2. Target批量验证 (Week 1新增功能)
+            target_logits, verified_gamma = self.target_verify_batch(draft_tokens, state, B)
             
-            # 3. 提交接受的部分
+            # 3. 基础匹配验证 (Week 1简化版本)
+            # TODO: Week 2将实现更复杂的token级匹配
+            if target_logits:
+                accept_length = verified_gamma  # 暂时全接受
+                print(f"[SDVAR] Basic matching: accepting all {accept_length} stages")
+            else:
+                accept_length = 0
+                print(f"[SDVAR] Target verification failed, rejecting all")
+            
+            # 4. 提交接受的部分
             state.accept_count += accept_length
             state.current_stage += accept_length
             
-            # 4. 如果没有进展，退化到单层生成（安全机制）
+            # 5. 如果没有进展，退化到单层生成（安全机制）
             if accept_length == 0:
                 state.gamma = 1
                 print(f"[SDVAR] Fallback to gamma=1 at stage {state.current_stage}")
