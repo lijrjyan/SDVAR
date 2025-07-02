@@ -1,6 +1,7 @@
 import math
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -712,7 +713,7 @@ class SDVAR(nn.Module):
                 draft_token_hub.append(draft_next_token_map)
                 draft_next_token_map = (
                     self.draft_model.word_embed(draft_next_token_map)
-                    + draft_lvl_pos[:, draft_cur_L : draft_cur_L + next_pn*next_pn]
+                    + draft_lvl_pos[:, draft_cur_L : draft_cur_L + next_pn**2]
                 )
                 draft_next_token_map = draft_next_token_map.repeat(2,1,1)
 
@@ -863,5 +864,235 @@ class SDVAR(nn.Module):
                     
         return self.vae_proxy[0].fhat_to_img(target_f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
         
-      
+    # =======================================================================================
+    # Week 1 实现：核心并行验证框架
+    # =======================================================================================
+    
+    def _initialize_inference_state(self, B: int, label_B, g_seed: Optional[int], 
+                                   cfg: float, gamma: int):
+        """初始化SDVAR推理状态"""
+        from dataclasses import dataclass
+        
+        # 验证模型兼容性
+        assert self.draft_model.patch_nums == self.target_model.patch_nums
+        patch_nums = self.draft_model.patch_nums
+        total_stages = len(patch_nums)
+        
+        # 处理随机数生成器
+        if g_seed is not None:
+            draft_rng = torch.Generator(device=self.draft_model.lvl_1L.device)
+            draft_rng.manual_seed(g_seed)
+            target_rng = torch.Generator(device=self.target_model.lvl_1L.device) 
+            target_rng.manual_seed(g_seed)
+            rng = target_rng  # 主要使用target的rng
+        else:
+            rng = None
+            
+        # 处理标签
+        if label_B is None:
+            uniform_prob = self.target_model.uniform_prob
+            label_B = torch.multinomial(
+                uniform_prob, num_samples=B, replacement=True, generator=rng
+            ).reshape(B)
+        elif isinstance(label_B, int):
+            label_B = torch.full(
+                (B,), fill_value=self.target_model.num_classes if label_B < 0 else label_B,
+                device=self.target_model.lvl_1L.device
+            )
+        
+        # 初始化draft模型状态
+        draft_sos, draft_cond_BD, _, draft_lvl_pos, draft_first_token_map, draft_f_hat = \
+            self.init_param(self.draft_model, B, label_B)
+            
+        # 初始化target模型状态
+        target_sos, target_cond_BD, _, target_lvl_pos, target_first_token_map, target_f_hat = \
+            self.init_param(self.target_model, B, label_B)
+        
+        # 创建状态对象（使用简单的类）
+        class SDVARInferenceState:
+            def __init__(self):
+                self.current_stage = 0
+                self.gamma = gamma
+                self.total_stages = total_stages
+                self.accept_count = 0
+                self.reject_count = 0
+                self.target_calls = 0
+                self.patch_nums = patch_nums
+                
+                # 运行时状态
+                self.draft_f_hat = draft_f_hat
+                self.target_f_hat = target_f_hat
+                self.draft_next_token_map = draft_first_token_map
+                self.target_next_token_map = target_first_token_map
+                
+                # 模型参数
+                self.draft_cond_BD = draft_cond_BD
+                self.target_cond_BD = target_cond_BD
+                self.draft_lvl_pos = draft_lvl_pos
+                self.target_lvl_pos = target_lvl_pos
+                
+                # 生成参数
+                self.cfg = cfg
+                self.rng = rng
+                self.top_k = 0
+                self.top_p = 0.0
+                self.more_smooth = False
+                
+                # token buffers for concatenation
+                self.accepted_tokens = []
+                self.current_tokens_length = 0
+        
+        state = SDVARInferenceState()
+        
+        return state
+    
+    def draft_generate_batch(self, state, B: int) -> List[torch.Tensor]:
+        """draft模型批量生成gamma层"""
+        gamma = min(state.gamma, state.total_stages - state.current_stage)
+        if gamma <= 0:
+            return []
+        
+        print(f"[SDVAR] Draft generating batch: gamma={gamma}, current_stage={state.current_stage}")
+        
+        # 确保KV cache开启
+        for blk in self.draft_model.blocks:
+            blk.attn.kv_caching(True)
+        
+        draft_tokens = []
+        current_tokens = state.draft_next_token_map
+        current_f_hat = state.draft_f_hat
+        
+        for gamma_step in range(gamma):
+            stage_idx = state.current_stage + gamma_step
+            pn = state.patch_nums[stage_idx]
+            
+            print(f"[SDVAR] Draft stage {stage_idx}, pn={pn}, tokens_shape={current_tokens.shape}")
+            
+            # 前向计算
+            x = current_tokens
+            for blk in self.draft_model.blocks:
+                x = blk(x=x, cond_BD=state.draft_cond_BD, attn_bias=None)
+            
+            logits = self.draft_model.get_logits(x, state.draft_cond_BD)
+            
+            # CFG处理
+            ratio = stage_idx / self.draft_model.num_stages_minus_1
+            t = state.cfg * ratio
+            logits = (1 + t) * logits[:B] - t * logits[B:]
+            
+            # 采样
+            tokens = sample_with_top_k_top_p_(
+                logits, rng=state.rng, top_k=state.top_k, 
+                top_p=state.top_p, num_samples=1
+            )[:, :, 0]
+            
+            draft_tokens.append(tokens)
+            
+            # 准备下一层的输入（如果不是最后一层）
+            if gamma_step < gamma - 1:
+                h_BChw = self.draft_model.vae_quant_proxy[0].embedding(tokens)
+                h_BChw = h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+                
+                # 更新f_hat和next_token_map
+                current_f_hat, next_token_map = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
+                    stage_idx, state.total_stages, current_f_hat, h_BChw
+                )
+                
+                if stage_idx + 1 < state.total_stages:
+                    next_pn = state.patch_nums[stage_idx + 1]
+                    current_tokens_length = sum(p**2 for p in state.patch_nums[:stage_idx+1])
+                    
+                    next_token_map = next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
+                    next_token_map = (
+                        self.draft_model.word_embed(next_token_map) + 
+                        state.draft_lvl_pos[:, current_tokens_length:current_tokens_length + next_pn**2]
+                    )
+                    current_tokens = next_token_map.repeat(2, 1, 1)  # CFG doubling
+        
+        # 更新state中的f_hat
+        if draft_tokens:
+            # 处理最后一个stage的f_hat更新
+            final_stage_idx = state.current_stage + len(draft_tokens) - 1
+            final_pn = state.patch_nums[final_stage_idx]
+            final_h_BChw = self.draft_model.vae_quant_proxy[0].embedding(draft_tokens[-1])
+            final_h_BChw = final_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, final_pn, final_pn)
+            
+            state.draft_f_hat, _ = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
+                final_stage_idx, state.total_stages, current_f_hat, final_h_BChw
+            )
+        
+        return draft_tokens
+
+    @torch.no_grad()
+    def sdvar_autoregressive_infer_cfg_parallel_v1(
+        self, B: int, label_B: Optional[Union[int, torch.LongTensor]] = None,
+        g_seed: Optional[int] = None, cfg: float = 1.5,
+        gamma: int = 2, top_k: int = 0, top_p: float = 0.0, more_smooth: bool = False
+    ) -> torch.Tensor:
+        """
+        SDVAR并行推理 v1.0 - 固定gamma版本
+        
+        核心改进：
+        1. 使用while循环代替for循环，支持γ批处理
+        2. draft模型连续生成γ层，target模型批量验证
+        3. 基础的匹配验证机制
+        4. 为后续的回滚和动态γ奠定基础
+        
+        :param B: batch size
+        :param label_B: imagenet label; if None, randomly sampled
+        :param g_seed: random seed
+        :param cfg: classifier-free guidance ratio
+        :param gamma: 批量处理的层数，固定为2
+        :param top_k: top-k sampling
+        :param top_p: top-p sampling
+        :param more_smooth: smoothing the pred using gumbel softmax
+        :return: reconstructed image (B, 3, H, W) in [0, 1]
+        """
+        print(f"[SDVAR] Starting parallel inference v1.0 with gamma={gamma}")
+        
+        # 初始化状态
+        state = self._initialize_inference_state(B, label_B, g_seed, cfg, gamma)
+        # 设置采样参数
+        state.top_k = top_k
+        state.top_p = top_p
+        state.more_smooth = more_smooth
+        
+        # 主推理循环 - 这里是关键改进：while循环代替for循环
+        while state.current_stage < state.total_stages:
+            print(f"[SDVAR] === Processing stages {state.current_stage} to {min(state.current_stage + gamma - 1, state.total_stages - 1)} ===")
+            
+            # 1. Draft批量生成
+            draft_tokens = self.draft_generate_batch(state, B)
+            if not draft_tokens:
+                print("[SDVAR] No more tokens to generate, breaking")
+                break
+            
+            actual_gamma = len(draft_tokens)
+            print(f"[SDVAR] Draft generated {actual_gamma} stages")
+            
+            # 2. 暂时使用简单的全接受策略 (Week 1基础版本)
+            # TODO: Week 2将实现真正的target验证和匹配逻辑
+            accept_length = actual_gamma
+            print(f"[SDVAR] Accepting all {accept_length} stages (simplified for Week 1)")
+            
+            # 3. 提交接受的部分
+            state.accept_count += accept_length
+            state.current_stage += accept_length
+            
+            # 4. 如果没有进展，退化到单层生成（安全机制）
+            if accept_length == 0:
+                state.gamma = 1
+                print(f"[SDVAR] Fallback to gamma=1 at stage {state.current_stage}")
+        
+        # 清理KV cache
+        for blk in self.draft_model.blocks:
+            blk.attn.kv_caching(False)
+        for blk in self.target_model.blocks:
+            blk.attn.kv_caching(False)
+        
+        print(f"[SDVAR] Inference completed. Accepted: {state.accept_count}, Target calls: {state.target_calls}")
+        
+        # 返回最终图像
+        return self.draft_model.vae_proxy[0].fhat_to_img(state.draft_f_hat).add_(1).mul_(0.5)
+
 
