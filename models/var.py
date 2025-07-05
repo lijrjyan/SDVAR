@@ -1329,31 +1329,53 @@ class SDVAR(nn.Module):
         return combined
 
     def _split_logits_by_stage(self, target_logits: torch.Tensor, 
-                              draft_tokens: List[torch.Tensor], B: int, state) -> List[torch.Tensor]:
-        """将target的logits分割回对应的层"""
-        print(f"[SDVAR] Splitting logits: input shape {target_logits.shape}")
+                            draft_tokens: List[torch.Tensor], B: int, state) -> List[torch.Tensor]:
+        """修复版本的logits分割"""
+        if not draft_tokens:
+            return []
         
+        verbose = True  # 调试开关
+        if verbose:
+            print(f"[SDVAR] Splitting logits: {target_logits.shape}")
+        
+        # 1. 验证CFG维度
+        expected_batch = 2 * B
+        if target_logits.shape[0] != expected_batch:
+            raise ValueError(f"Expected batch size {expected_batch}, got {target_logits.shape[0]}")
+        
+        # 2. 计算正确的起始位置
+        base_pos = 0
+        if state.current_stage == 0:
+            base_pos = self.target_model.first_l  # 跳过第一层
+        else:
+            base_pos = sum(p**2 for p in state.patch_nums[:state.current_stage])
+        
+        if verbose:
+            print(f"[SDVAR] Base position: {base_pos}")
+        
+        # 3. 分割每个stage的logits
         logits_per_stage = []
-        current_pos = 0
+        current_pos = base_pos
         
-        # 如果有前缀tokens，先跳过它们
-        if state.current_stage > 0:
-            prefix_length = sum(p**2 for p in state.patch_nums[:state.current_stage])
-            current_pos = prefix_length
-            print(f"[SDVAR] Skipping prefix tokens: {prefix_length}")
-        
-        # 分割每个stage的logits
         for stage_idx, tokens in enumerate(draft_tokens):
             current_stage = state.current_stage + stage_idx
             pn = state.patch_nums[current_stage]
             stage_length = pn * pn
             
+            # 检查边界
+            if current_pos + stage_length > target_logits.shape[1]:
+                if verbose:
+                    print(f"[SDVAR] Warning: Stage {current_stage} exceeds logits length")
+                break
+            
             # 提取这个stage的logits
             stage_logits = target_logits[:, current_pos:current_pos + stage_length, :]
             logits_per_stage.append(stage_logits)
-            current_pos += stage_length
             
-            print(f"[SDVAR] Stage {current_stage} logits shape: {stage_logits.shape}")
+            if verbose:
+                print(f"[SDVAR] Stage {current_stage} logits: {stage_logits.shape}")
+            
+            current_pos += stage_length
         
         return logits_per_stage
 
