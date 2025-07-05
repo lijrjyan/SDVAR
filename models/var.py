@@ -660,9 +660,20 @@ class SDVAR(nn.Module):
             B: int,
             label_B,
         ):        
-        sos = cond_BD = model.class_emb(
-            torch.cat((label_B, torch.full_like(label_B, fill_value=model.num_classes)), dim=0)
-        )   
+        # 确保label_B在正确设备上
+        device = next(model.parameters()).device
+        if hasattr(label_B, 'device') and label_B.device != device:
+            label_B = label_B.to(device)
+        elif isinstance(label_B, (int, list)):
+            label_B = torch.tensor(label_B, device=device)
+        
+        # 创建class embedding输入
+        class_input = torch.cat((
+            label_B, 
+            torch.full_like(label_B, fill_value=model.num_classes)
+        ), dim=0)
+        
+        sos = cond_BD = model.class_emb(class_input)
         cond_BD_or_gss = model.shared_ada_lin(cond_BD)
 
         lvl_pos = model.lvl_embed(model.lvl_1L) + model.pos_1LC
