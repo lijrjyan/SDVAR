@@ -125,7 +125,6 @@ top_p = 0.95
 
 # SDVAR专用参数
 gamma_values = [1, 2, 3]  # 测试不同的γ值 (并行验证的层数)
-similarity_thresholds = [0.5, 0.7, 0.9]  # 不同的相似度阈值
 test_classes = (980, 437, 22, 562)  # 测试类别：volcano, beach_wagon, fox, fountain_pen
 
 # 随机种子设置
@@ -144,7 +143,6 @@ torch.set_float32_matmul_precision('high' if tf32 else 'highest')
 
 print(f"🎯 Test Parameters:")
 print(f"   Gamma values: {gamma_values}")
-print(f"   Similarity thresholds: {similarity_thresholds}")
 print(f"   Test classes: {test_classes}")
 print(f"   CFG scale: {cfg}")
 
@@ -186,9 +184,9 @@ print(f"   Target VAR: {sum(p.numel() for p in target_var.parameters())/1e6:.1f}
 print("🚀 Testing Latest SDVAR Parallel Verification Framework")
 print("=" * 60)
 
-def test_sdvar_parallel_verification(gamma=2, similarity_thresh=0.7, test_name="Parallel Verification"):
+def test_sdvar_parallel_verification(gamma=2, test_name="Parallel Verification"):
     """测试最新的SDVAR并行验证框架"""
-    print(f"\n🧪 {test_name} (γ={gamma}, threshold={similarity_thresh})")
+    print(f"\n🧪 {test_name} (γ={gamma})")
     
     B = len(test_classes)
     label_B = torch.tensor(test_classes, device=device)
@@ -206,9 +204,7 @@ def test_sdvar_parallel_verification(gamma=2, similarity_thresh=0.7, test_name="
                 top_p=top_p,
                 g_seed=seed,
                 gamma=gamma,
-                similarity_threshold=similarity_thresh,
-                max_retries=3,
-                verbose=True
+                more_smooth=more_smooth
             )
             method_name = "Parallel Verification v1"
         else:
@@ -249,7 +245,6 @@ gamma_results = {}
 for gamma in gamma_values:
     time_taken, images = test_sdvar_parallel_verification(
         gamma=gamma, 
-        similarity_thresh=0.7, 
         test_name=f"Gamma-{gamma} Test"
     )
     if time_taken is not None:
@@ -278,7 +273,7 @@ def performance_comparison_test():
         if hasattr(sd_var, 'sdvar_autoregressive_infer_cfg_parallel_v1'):
             recon_seq = sd_var.sdvar_autoregressive_infer_cfg_parallel_v1(
                 B=B, label_B=label_B, cfg=cfg, top_k=top_k, top_p=top_p,
-                g_seed=seed, gamma=1, similarity_threshold=0.7, verbose=False
+                g_seed=seed, gamma=1, more_smooth=more_smooth
             )
         else:
             recon_seq = sd_var.sdvar_autoregressive_infer_cfg(
@@ -298,7 +293,7 @@ def performance_comparison_test():
         if hasattr(sd_var, 'sdvar_autoregressive_infer_cfg_parallel_v1'):
             recon_par = sd_var.sdvar_autoregressive_infer_cfg_parallel_v1(
                 B=B, label_B=label_B, cfg=cfg, top_k=top_k, top_p=top_p,
-                g_seed=seed, gamma=2, similarity_threshold=0.7, verbose=False
+                g_seed=seed, gamma=2, more_smooth=more_smooth
             )
         else:
             print("⚠️ Parallel verification not available, using standard method")
@@ -358,7 +353,7 @@ def quality_validation_test():
         if hasattr(sd_var, 'sdvar_autoregressive_infer_cfg_parallel_v1'):
             sdvar_images = sd_var.sdvar_autoregressive_infer_cfg_parallel_v1(
                 B=B, label_B=label_B, cfg=cfg, top_k=top_k, top_p=top_p,
-                g_seed=seed, gamma=2, similarity_threshold=0.7, verbose=False
+                g_seed=seed, gamma=2, more_smooth=more_smooth
             )
         else:
             sdvar_images = sd_var.sdvar_autoregressive_infer_cfg(
@@ -407,11 +402,9 @@ def detailed_performance_analysis():
     results = {}
     
     test_configs = [
-        {"gamma": 1, "threshold": 0.5, "name": "Conservative γ=1"},
-        {"gamma": 2, "threshold": 0.5, "name": "Moderate γ=2, Low Threshold"},
-        {"gamma": 2, "threshold": 0.7, "name": "Balanced γ=2, Medium Threshold"},
-        {"gamma": 2, "threshold": 0.9, "name": "Aggressive γ=2, High Threshold"},
-        {"gamma": 3, "threshold": 0.7, "name": "High γ=3"},
+        {"gamma": 1, "name": "Conservative γ=1"},
+        {"gamma": 2, "name": "Moderate γ=2"},
+        {"gamma": 3, "name": "High γ=3"},
     ]
     
     B = len(test_classes)
@@ -421,7 +414,7 @@ def detailed_performance_analysis():
     
     for config in test_configs:
         print(f"\n⚙️ {config['name']}")
-        print(f"   γ={config['gamma']}, threshold={config['threshold']}")
+        print(f"   γ={config['gamma']}")
         
         start_time = time.time()
         try:
@@ -430,8 +423,7 @@ def detailed_performance_analysis():
                     B=B, label_B=label_B, cfg=cfg, top_k=top_k, top_p=top_p,
                     g_seed=seed, 
                     gamma=config['gamma'], 
-                    similarity_threshold=config['threshold'],
-                    verbose=False
+                    more_smooth=more_smooth
                 )
             else:
                 _ = sd_var.sdvar_autoregressive_infer_cfg(
@@ -482,7 +474,6 @@ def generate_summary_report():
     print(f"\n🚀 Key Achievements:")
     print(f"   ✅ Successfully implemented parallel verification framework")
     print(f"   ✅ Tested multiple γ values: {gamma_values}")
-    print(f"   ✅ Validated different similarity thresholds: {similarity_thresholds}")
     
     if 'perf_results' in globals() and speedup:
         print(f"   ✅ Achieved {speedup:.2f}x speedup with parallel verification")
@@ -503,7 +494,7 @@ def generate_summary_report():
     
     print(f"\n📈 Next Steps:")
     print(f"   • Test on larger batch sizes and different image classes")
-    print(f"   • Optimize similarity threshold selection strategy")
+    print(f"   • Optimize token matching strategies")
     print(f"   • Implement advanced rollback mechanisms")
     print(f"   • Add comprehensive quality metrics (FID, IS)")
     
@@ -524,14 +515,12 @@ def interactive_test_panel():
     # 参数输入
     try:
         custom_gamma = int(input(f"Enter γ value (1-3, default 2): ") or "2")
-        custom_threshold = float(input(f"Enter similarity threshold (0.1-0.9, default 0.7): ") or "0.7")
         custom_cfg = float(input(f"Enter CFG scale (1.0-10.0, default {cfg}): ") or str(cfg))
         custom_classes = input(f"Enter class IDs (comma-separated, default '{','.join(map(str, test_classes))}'): ") or ','.join(map(str, test_classes))
         custom_classes = [int(x.strip()) for x in custom_classes.split(',')]
         
         print(f"\n🎯 Running custom test with:")
         print(f"   γ = {custom_gamma}")
-        print(f"   Threshold = {custom_threshold}")
         print(f"   CFG = {custom_cfg}")
         print(f"   Classes = {custom_classes}")
         
@@ -543,7 +532,7 @@ def interactive_test_panel():
         if hasattr(sd_var, 'sdvar_autoregressive_infer_cfg_parallel_v1'):
             custom_images = sd_var.sdvar_autoregressive_infer_cfg_parallel_v1(
                 B=B, label_B=label_B, cfg=custom_cfg, top_k=top_k, top_p=top_p,
-                g_seed=seed, gamma=custom_gamma, similarity_threshold=custom_threshold, verbose=True
+                g_seed=seed, gamma=custom_gamma, more_smooth=more_smooth
             )
         else:
             custom_images = sd_var.sdvar_autoregressive_infer_cfg(
