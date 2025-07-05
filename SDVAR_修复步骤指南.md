@@ -331,3 +331,94 @@ print(f"平均像素差异: {diff.item():.6f}")
 ---
 
 **💡 提示**: 一次只修复一个函数，每次修复后都要测试，确保没有引入新的问题！ 
+
+## 🛠️ 修复VAR对比测试
+
+请将Cell 9.5中的代码修改为：
+
+```python
+# ===================== CELL 9.5: VAR基线对比测试 =====================
+print("🔍 VAR基线对比测试")
+print("="*50)
+
+try:
+    print("🧪 运行普通VAR推理...")
+    
+    # 使用sdvar_model中的target_model进行标准VAR推理
+    var_result = sdvar_model.target_model.autoregressive_infer_cfg(
+        B=1,
+        label_B=torch.tensor([980]).to('cuda'),  # 相同的volcano class，确保在正确设备上
+        cfg=1.5,
+        g_seed=42  # 固定随机种子以便对比
+    )
+    
+    print(f"✅ VAR推理成功!")
+    print(f"📊 VAR输出形状: {var_result.shape}")
+    print(f"📊 VAR数值范围: [{var_result.min():.3f}, {var_result.max():.3f}]")
+    
+    # 保存VAR基线结果
+    from torchvision.utils import save_image
+    save_image(var_result, 'var_baseline_test.png')
+    print("🖼️ VAR基线图像已保存为 var_baseline_test.png")
+    
+    # 同时显示两个结果进行对比
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    # VAR基线结果
+    var_img = Image.open('var_baseline_test.png')
+    axes[0].imshow(var_img)
+    axes[0].set_title('VAR基线 (标准推理)', fontsize=14)
+    axes[0].axis('off')
+    
+    # SDVAR结果
+    try:
+        sdvar_img = Image.open('sdvar_parallel_v1_test.png')
+        axes[1].imshow(sdvar_img)
+        axes[1].set_title('SDVAR Parallel v1.0', fontsize=14)
+        axes[1].axis('off')
+    except FileNotFoundError:
+        axes[1].text(0.5, 0.5, 'SDVAR图像未找到', ha='center', va='center')
+        axes[1].set_title('SDVAR Parallel v1.0 (未生成)', fontsize=14)
+        axes[1].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n📊 对比分析:")
+    print(f"VAR基线:  形状{var_result.shape}, 范围[{var_result.min():.3f}, {var_result.max():.3f}]")
+    
+    # 如果SDVAR结果存在，进行数值对比
+    try:
+        # 假设sdvar_result是之前存储的结果
+        if 'result_img' in locals():
+            print(f"SDVAR v1:  形状{result_img.shape}, 范围[{result_img.min():.3f}, {result_img.max():.3f}]")
+            
+            # 计算L2距离
+            l2_distance = torch.norm(var_result - result_img).item()
+            print(f"🔍 L2距离: {l2_distance:.3f}")
+            
+            # 计算相关性
+            correlation = torch.corrcoef(torch.stack([
+                var_result.flatten(), 
+                result_img.flatten()
+            ]))[0, 1].item()
+            print(f"🔍 像素相关性: {correlation:.3f}")
+        else:
+            print("SDVAR结果不可用，无法进行数值对比")
+    except Exception as e:
+        print(f"数值对比失败: {e}")
+    
+except Exception as e:
+    print(f"❌ VAR对比测试失败: {str(e)}")
+    import traceback
+    print("详细错误信息:")
+    traceback.print_exc()
+    
+    print("\n💡 修复建议:")
+    print("1. 确保sdvar_model已正确加载")
+    print("2. 检查target_model是否可访问: sdvar_model.target_model")
+    print("3. 确保标签tensor在正确的设备上")
+``` 
