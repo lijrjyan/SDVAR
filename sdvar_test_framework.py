@@ -234,15 +234,29 @@ class SDVARParallelV1Tester:
             # 调用函数
             combined_query = self.sdvar_model._build_combined_query(draft_tokens, state, B)
             
-            # 验证结果
+            # 验证结果 - 修复期望值计算
             expected_batch_size = 2 * B  # CFG doubling
-            total_tokens = sum(state.patch_nums[i] ** 2 for i in range(len(draft_tokens)))
+            
+            # 正确计算token数量：包括first_token_map(如果current_stage=0) + draft_tokens
+            draft_token_count = sum(state.patch_nums[state.current_stage + i] ** 2 for i in range(len(draft_tokens)))
+            if state.current_stage == 0:
+                total_tokens = 1 + draft_token_count  # first_token_map(1) + draft_tokens
+            else:
+                total_tokens = draft_token_count  # 只有draft_tokens
+            
+            # 获取实际的embedding维度
+            target_embed_dim = self.sdvar_model.target_model.C  # 使用实际的embed_dim
+            
+            # 调试信息
+            print(f"[TEST] current_stage={state.current_stage}, draft_tokens={len(draft_tokens)}")
+            print(f"[TEST] draft_token_count={draft_token_count}, total_expected={total_tokens}")
+            print(f"[TEST] target_embed_dim={target_embed_dim}, actual_shape={combined_query.shape}")
             
             checks = {
                 "返回tensor": isinstance(combined_query, torch.Tensor),
                 "batch维度": combined_query.shape[0] == expected_batch_size,
                 "token维度": combined_query.shape[1] == total_tokens,
-                "特征维度": combined_query.shape[2] == 1024,  # embed_dim
+                "特征维度": combined_query.shape[2] == target_embed_dim,  # 使用实际embed_dim
                 "无NaN值": not torch.isnan(combined_query).any(),
                 "无Inf值": not torch.isinf(combined_query).any(),
             }
