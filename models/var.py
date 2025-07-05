@@ -1214,7 +1214,7 @@ class SDVAR(nn.Module):
 
     def target_verify_batch(self, draft_tokens: List[torch.Tensor], 
                            state, B: int) -> Tuple[List[torch.Tensor], int]:
-        """target模型批量验证draft生成的tokens"""
+        """target模型批量验证draft生成的tokens - 修复版本"""
         if not draft_tokens:
             return [], 0
         
@@ -1229,8 +1229,15 @@ class SDVAR(nn.Module):
         mask_length = combined_query.shape[1]
         attn_bias = self._get_attention_mask(mask_length, state.current_stage, gamma)
         
-        # 确保KV cache开启
+        # 🔧 关键修复：完全重置KV cache
         for blk in self.target_model.blocks:
+            blk.attn.kv_caching(False)  # 先关闭
+            # 强制清空已有的cache
+            if hasattr(blk.attn, 'k_cache'):
+                blk.attn.k_cache = None
+            if hasattr(blk.attn, 'v_cache'):
+                blk.attn.v_cache = None
+            # 再重新开启（这样确保是干净的状态）
             blk.attn.kv_caching(True)
         
         # target前向计算
@@ -1242,6 +1249,7 @@ class SDVAR(nn.Module):
             x = blk(x=x, cond_BD=state.target_cond_BD, attn_bias=attn_bias)
         
         target_logits = self.target_model.get_logits(x, state.target_cond_BD)
+        print(f"[SDVAR] After target forward: logits shape {target_logits.shape}")
         
         # 分割logits回对应的层
         logits_per_stage = self._split_logits_by_stage(target_logits, draft_tokens, B, state)

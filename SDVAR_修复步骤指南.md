@@ -421,4 +421,274 @@ except Exception as e:
     print("1. 确保sdvar_model已正确加载")
     print("2. 检查target_model是否可访问: sdvar_model.target_model")
     print("3. 确保标签tensor在正确的设备上")
+```
+
+## 🚨 根本原因分析
+
+从代码可以看出，我们在target验证时开启了KV cache：
+
+```python
+# 确保KV cache开启
+for blk in self.target_model.blocks:
+    blk.attn.kv_caching(True)
+```
+
+**KV Cache的工作机制**：
+- 在自回归生成中，KV cache会缓存之前计算的key和value
+- 当cache不为空时，模型可能只对新的token计算logits
+- 这就解释了为什么6个token的输入只产生了5个token的输出！
+
+## 🛠️ 诊断和修复方案
+
+请在Colab中添加以下诊断代码来验证我的分析：
+
+```python
+# ===================== 诊断代码 =====================
+print("🔍 KV Cache诊断")
+print("="*50)
+
+# 检查target模型的KV cache状态
+print("Target模型KV Cache状态检查:")
+for i, blk in enumerate(sdvar_model.target_model.blocks[:3]):  # 只检查前3个blocks
+    if hasattr(blk.attn, 'k_cache') and blk.attn.k_cache is not None:
+        print(f"  Block {i}: KV cache存在, k_cache shape: {blk.attn.k_cache.shape}")
+    else:
+        print(f"  Block {i}: KV cache为空")
+
+# 关闭KV cache后重新测试
+print("\n🔧 强制清空KV cache后重新测试...")
+for blk in sdvar_model.target_model.blocks:
+    blk.attn.kv_caching(False)
+    # 强制清空cache
+    if hasattr(blk.attn, 'k_cache'):
+        blk.attn.k_cache = None
+    if hasattr(blk.attn, 'v_cache'):
+        blk.attn.v_cache = None
+
+# 重新运行测试
+from sdvar_test_framework import SDVARParallelV1Tester
+tester = SDVARParallelV1Tester(sdvar_model)
+result = tester.test_split_logits_by_stage(B=1, gamma=2)
+print("清空cache后的测试结果:", result)
+```
+
+## 🛠️ 永久修复方案
+
+问题在于我们需要在每次target验证前**完全重置KV cache**。请修改`target_verify_batch`函数：
+
+```python
+def target_verify_batch(self, draft_tokens: List[torch.Tensor], 
+                       state, B: int) -> Tuple[List[torch.Tensor], int]:
+    """target模型批量验证draft生成的tokens"""
+    if not draft_tokens:
+        return [], 0
+    
+    gamma = len(draft_tokens)
+    print(f"[SDVAR] Target verifying batch: gamma={gamma}, current_stage={state.current_stage}")
+    
+    # 构建联合查询序列
+    combined_query = self._build_combined_query(draft_tokens, state, B)
+    print(f"[SDVAR] Combined query shape: {combined_query.shape}")
+    
+    # 计算适当的注意力掩码
+    mask_length = combined_query.shape[1]
+    attn_bias = self._get_attention_mask(mask_length, state.current_stage, gamma)
+    
+    # 🔧 关键修复：完全重置KV cache
+    for blk in self.target_model.blocks:
+        blk.attn.kv_caching(False)  # 先关闭
+        # 强制清空已有的cache
+        if hasattr(blk.attn, 'k_cache'):
+            blk.attn.k_cache = None
+        if hasattr(blk.attn, 'v_cache'):
+            blk.attn.v_cache = None
+        # 再重新开启（这样确保是干净的状态）
+        blk.attn.kv_caching(True)
+    
+    # target前向计算
+    state.target_calls += 1  # 统计调用次数
+    print(f"[SDVAR] Target forward call #{state.target_calls}")
+    
+    x = combined_query
+    for blk in self.target_model.blocks:
+        x = blk(x=x, cond_BD=state.target_cond_BD, attn_bias=attn_bias)
+    
+    target_logits = self.target_model.get_logits(x, state.target_cond_BD)
+    print(f"[SDVAR] After target forward: logits shape {target_logits.shape}")
+    
+    # 分割logits回对应的层
+    logits_per_stage = self._split_logits_by_stage(target_logits, draft_tokens, B, state)
+    
+    # 应用CFG
+    cfg_logits = []
+    for stage_idx, stage_logits in enumerate(logits_per_stage):
+        current_stage = state.current_stage + stage_idx
+        ratio = current_stage / self.target_model.num_stages_minus_1
+        t = state.cfg * ratio
+        cfg_stage_logits = (1 + t) * stage_logits[:B] - t * stage_logits[B:]
+        cfg_logits.append(cfg_stage_logits)
+    
+    print(f"[SDVAR] Target verification completed, generated {len(cfg_logits)} stage logits")
+    return cfg_logits, gamma
+```
+
+请先运行诊断代码验证我的分析是否正确，然后我们可以应用这个修复方案。 
+
+## 🔍 KV Cache诊断和修复方案
+
+请先运行诊断代码验证我的分析是否正确，然后我们可以应用这个修复方案。
+
+## 🔍 详细CFG诊断
+
+从最新的错误信息看，问题可能在于CFG处理过程中的tensor维度不匹配。请运行以下详细诊断：
+
+```python
+# ===================== 详细CFG诊断代码 =====================
+print("🔍 CFG和Tensor维度诊断")
+print("="*50)
+
+# 手动构建combined query来追踪问题
+from sdvar_test_framework import SDVARParallelV1Tester
+tester = SDVARParallelV1Tester(sdvar_model)
+
+# 初始化state
+state = sdvar_model._initialize_inference_state(B=1, label_B=torch.tensor([980]), g_seed=42, cfg=1.5, gamma=2)
+print(f"初始化完成，state.target_cond_BD shape: {state.target_cond_BD.shape}")
+
+# 生成draft tokens  
+draft_tokens = sdvar_model.draft_generate_batch(state, B=1, verbose=False)
+print(f"Draft tokens生成完成: {len(draft_tokens)} stages")
+for i, tokens in enumerate(draft_tokens):
+    print(f"  Stage {i}: {tokens.shape}")
+
+# 手动构建combined query并跟踪每一步
+print("\n🔍 手动构建Combined Query过程:")
+try:
+    # 调用_build_combined_query并捕获可能的错误
+    combined_query = sdvar_model._build_combined_query(draft_tokens, state, B=1)
+    print(f"✅ Combined query构建成功: {combined_query.shape}")
+    
+    # 检查state中相关变量的形状
+    print(f"state.target_cond_BD shape: {state.target_cond_BD.shape}")
+    print(f"state.target_lvl_pos shape: {state.target_lvl_pos.shape}")
+    
+    # 手动执行target forward过程
+    print("\n🔍 Target Forward过程诊断:")
+    
+    # 重置KV cache
+    for blk in sdvar_model.target_model.blocks:
+        blk.attn.kv_caching(False)
+        blk.attn.kv_caching(True)
+    
+    print(f"输入到target模型: {combined_query.shape}")
+    
+    # 执行target forward
+    x = combined_query
+    print(f"初始x: {x.shape}")
+    
+    # 逐个block检查
+    for i, blk in enumerate(sdvar_model.target_model.blocks[:3]):  # 只检查前3个
+        try:
+            x_before = x.shape
+            x = blk(x=x, cond_BD=state.target_cond_BD, attn_bias=None)
+            print(f"Block {i}: {x_before} -> {x.shape}")
+        except Exception as e:
+            print(f"❌ Block {i} 失败: {str(e)}")
+            break
+    
+    # 检查get_logits
+    try:
+        logits = sdvar_model.target_model.get_logits(x, state.target_cond_BD)
+        print(f"✅ get_logits成功: {logits.shape}")
+    except Exception as e:
+        print(f"❌ get_logits失败: {str(e)}")
+        print(f"x shape: {x.shape}")
+        print(f"cond_BD shape: {state.target_cond_BD.shape}")
+        
+except Exception as e:
+    print(f"❌ Combined query构建失败: {str(e)}")
+    import traceback
+    traceback.print_exc()
+```
+
+## 🛠️ CFG维度修复方案
+
+基于诊断结果，问题可能在于`target_cond_BD`的维度处理。请检查以下修复：
+
+```python
+def _build_combined_query(self, draft_tokens: List[torch.Tensor], 
+                        state, B: int) -> torch.Tensor:
+    """修复版本的combined query构建 - 处理CFG维度问题"""
+    if not draft_tokens:
+        return torch.empty(2 * B, 0, 1920, device=state.draft_f_hat.device)
+    
+    verbose = True  # 调试开关
+    if verbose:
+        print(f"[SDVAR] Building combined query for {len(draft_tokens)} stages")
+        print(f"[SDVAR] Input B={B}, state.target_cond_BD.shape={state.target_cond_BD.shape}")
+    
+    # 1. 正确计算位置偏移
+    base_pos = sum(p**2 for p in state.patch_nums[:state.current_stage])
+    if verbose:
+        print(f"[SDVAR] Base position: {base_pos}, current_stage: {state.current_stage}")
+    
+    # 2. 构建完整输入序列
+    all_embeddings = []
+    
+    # 3. 如果是第一阶段，需要添加first_token_map
+    if state.current_stage == 0:
+        # 获取第一层的token map
+        first_l = self.target_model.first_l
+        
+        # 🔧 关键修复：确保sos只取前B个，避免CFG doubling问题
+        sos = state.target_cond_BD[:B]  # 只取前B个，不要CFG doubling的部分
+        if verbose:
+            print(f"[SDVAR] sos shape after slicing: {sos.shape}")
+        
+        first_token_map = (
+            sos.unsqueeze(1).expand(B, first_l, -1) +
+            self.target_model.pos_start.expand(B, first_l, -1) +
+            state.target_lvl_pos[:1, :first_l].expand(B, -1, -1)
+        )
+        all_embeddings.append(first_token_map)
+        current_pos = first_l
+        
+        if verbose:
+            print(f"[SDVAR] Added first_token_map: {first_token_map.shape}")
+    else:
+        current_pos = base_pos
+        # TODO: 添加之前已接受的tokens (Week 2功能)
+        if verbose:
+            print(f"[SDVAR] Skipping first layer, starting from position: {current_pos}")
+    
+    # 4. 处理每个draft token stage
+    for stage_idx, tokens in enumerate(draft_tokens):
+        current_stage = state.current_stage + stage_idx
+        pn = state.patch_nums[current_stage]
+        
+        if verbose:
+            print(f"[SDVAR] Processing stage {current_stage}, tokens: {tokens.shape}, pn: {pn}")
+        
+        # 正确的embedding路径：tokens -> VAE embedding -> word embedding
+        vae_embedding = self.target_model.vae_quant_proxy[0].embedding(tokens)  # (B, pn*pn, Cvae)
+        stage_embedding = self.target_model.word_embed(vae_embedding)  # (B, pn*pn, C)
+        
+        # 添加位置编码
+        pos_embed = state.target_lvl_pos[:1, current_pos:current_pos + pn*pn].expand(B, -1, -1)
+        stage_embedding = stage_embedding + pos_embed
+        
+        all_embeddings.append(stage_embedding)
+        current_pos += pn * pn
+        
+        if verbose:
+            print(f"[SDVAR] Stage {current_stage} embedding: {stage_embedding.shape}")
+    
+    # 5. 拼接所有embeddings并进行CFG doubling
+    combined = torch.cat(all_embeddings, dim=1)  # B, total_tokens, C
+    combined = combined.repeat(2, 1, 1)  # CFG doubling -> 2B, total_tokens, C
+    
+    if verbose:
+        print(f"[SDVAR] Final combined query: {combined.shape}")
+    
+    return combined
 ``` 
