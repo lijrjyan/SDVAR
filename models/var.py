@@ -1221,67 +1221,44 @@ class SDVAR(nn.Module):
         print(f"[SDVAR] Target verification completed, generated {len(cfg_logits)} stage logits")
         return cfg_logits, gamma
 
-    def _build_combined_query(self, draft_tokens: List[torch.Tensor], 
-                             state, B: int) -> torch.Tensor:
-        """将多层draft tokens组合成target的查询序列"""
-        print(f"[SDVAR] Building combined query for {len(draft_tokens)} stages")
+    def _build_combined_query(self, draft_tokens: List[torch.Tensor], state, B: int) -> torch.Tensor:
+        """修复版本的combined query构建"""
         
-        # 构建完整的输入序列，模仿VAR的正常推理流程
+        # 1. 正确计算位置偏移
+        base_pos = sum(p**2 for p in state.patch_nums[:state.current_stage])
+        
+        # 2. 构建完整输入序列
         all_embeddings = []
         
-        # 计算当前位置偏移 - 注意：这里只处理单batch，CFG在最后处理
-        if state.current_stage == 0:
-            # 如果是从第一阶段开始，需要包含first_token_map
-            # 这里只取B个样本，不是2*B（CFG在最后处理）
-            sos = state.target_cond_BD[:B]  # 只取前B个
-            first_l = self.target_model.first_l
-            first_token_map = (
-                sos.unsqueeze(1).expand(B, first_l, -1) +
-                self.target_model.pos_start.expand(B, first_l, -1) +
-                state.target_lvl_pos[:1, :first_l].expand(B, -1, -1)  # 扩展到B个样本
-            )
-            all_embeddings.append(first_token_map)
-            current_pos = first_l
-        else:
-            current_pos = sum(p**2 for p in state.patch_nums[:state.current_stage])
-            # TODO: 添加之前已接受tokens的embedding
-            # 目前简化处理，假设state中会维护这些信息
+        # 3. 处理之前的tokens (如果有)
+        if state.current_stage > 0:
+            # 从state中获取之前接受的tokens
+            # TODO: 需要在state中正确维护这些信息
+            pass
         
-        # 处理每个draft token stage
+        # 4. 处理draft tokens
+        current_pos = base_pos
         for stage_idx, tokens in enumerate(draft_tokens):
             current_stage = state.current_stage + stage_idx
             pn = state.patch_nums[current_stage]
             
-            print(f"[SDVAR] Processing stage {current_stage}, tokens shape: {tokens.shape}, pn={pn}")
+            # 正确的embedding路径
+            h_BChw = self.target_model.vae_quant_proxy[0].embedding(tokens)
+            h_embed = h_BChw.transpose(1, 2)  # B, pn*pn, Cvae
             
-            # 简化的处理方式：直接从VAE embedding到word_embed
-            # 避免复杂的tensor变换，直接使用VAE embedding的输出
-            vae_embedding = self.target_model.vae_quant_proxy[0].embedding(tokens)  # (B, pn*pn, Cvae)
-            print(f"[SDVAR] VAE embedding shape: {vae_embedding.shape}")
+            # word embedding
+            stage_embedding = self.target_model.word_embed(h_embed)
             
-            # 直接将VAE embedding传给word_embed
-            # word_embed期望输入格式为(B, L, Cvae)
-            stage_embedding = self.target_model.word_embed(vae_embedding)  # (B, pn*pn, C)
-            print(f"[SDVAR] After word_embed shape: {stage_embedding.shape}")
-            
-            # 添加位置编码 - 确保维度匹配
-            pos_embed = state.target_lvl_pos[:1, current_pos:current_pos + pn * pn].expand(B, -1, -1)
-            print(f"[SDVAR] pos_embed shape: {pos_embed.shape}")
-            
-            # 应用位置编码
+            # 正确的位置编码
+            pos_embed = state.target_lvl_pos[:, current_pos:current_pos + pn*pn]
             stage_embedding = stage_embedding + pos_embed
+            
             all_embeddings.append(stage_embedding)
-            
-            print(f"[SDVAR] Stage {current_stage} final embedding shape: {stage_embedding.shape}")
-            
             current_pos += pn * pn
         
-        # 拼接所有embeddings
-        combined = torch.cat(all_embeddings, dim=1)  # B, total_tokens, C
-        print(f"[SDVAR] Combined embeddings shape: {combined.shape}")
-        
-        # CFG doubling
-        combined = combined.repeat(2, 1, 1)
+        # 5. 拼接和CFG处理
+        combined = torch.cat(all_embeddings, dim=1)
+        combined = combined.repeat(2, 1, 1)  # CFG doubling
         
         return combined
 
