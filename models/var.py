@@ -1097,13 +1097,18 @@ class SDVAR(nn.Module):
         return state
     
     def draft_generate_batch(self, state, B: int, verbose: bool = False) -> List[torch.Tensor]:
-        """draft模型批量生成gamma层"""
+        """draft模型批量生成gamma层 - 修复设备问题版本"""
         gamma = min(state.gamma, state.total_stages - state.current_stage)
         if gamma <= 0:
             return []
         
         if verbose:
             print(f"[SDVAR] Draft generating batch: gamma={gamma}, current_stage={state.current_stage}")
+        
+        # 确保模型在正确设备上
+        device = state.draft_f_hat.device
+        if verbose:
+            print(f"[SDVAR] Using device: {device}")
         
         # 确保KV cache开启
         for blk in self.draft_model.blocks:
@@ -1118,7 +1123,8 @@ class SDVAR(nn.Module):
             pn = state.patch_nums[stage_idx]
             
             if verbose:
-                print(f"[SDVAR] Draft stage {stage_idx}, pn={pn}, tokens_shape={current_tokens.shape}")
+                print(f"[SDVAR] Draft stage {stage_idx}, pn={pn}")
+                print(f"[SDVAR] current_tokens device: {current_tokens.device}")
             
             # 前向计算
             x = current_tokens
@@ -1132,18 +1138,31 @@ class SDVAR(nn.Module):
             t = state.cfg * ratio
             logits = (1 + t) * logits[:B] - t * logits[B:]
             
-            # 采样
+            if verbose:
+                print(f"[SDVAR] logits device: {logits.device}")
+            
+            # 采样 - 确保结果在正确设备上
             tokens = sample_with_top_k_top_p_(
                 logits, rng=state.rng, top_k=state.top_k, 
                 top_p=state.top_p, num_samples=1
             )[:, :, 0]
             
+            # 强制确保tokens在正确设备上
+            tokens = tokens.to(device)
+            
+            if verbose:
+                print(f"[SDVAR] tokens device: {tokens.device}, shape: {tokens.shape}")
+            
             draft_tokens.append(tokens)
             
             # 准备下一层的输入（如果不是最后一层）
             if gamma_step < gamma - 1:
+                # VAE embedding - 确保设备匹配
                 h_BChw = self.draft_model.vae_quant_proxy[0].embedding(tokens)
                 h_BChw = h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, pn, pn)
+                
+                if verbose:
+                    print(f"[SDVAR] h_BChw device: {h_BChw.device}")
                 
                 # 更新f_hat和next_token_map
                 current_f_hat, next_token_map = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
@@ -1155,11 +1174,18 @@ class SDVAR(nn.Module):
                     current_tokens_length = sum(p**2 for p in state.patch_nums[:stage_idx+1])
                     
                     next_token_map = next_token_map.view(B, self.draft_model.Cvae, -1).transpose(1, 2)
+                    
+                    # 确保位置编码在正确设备上
+                    pos_embed = state.draft_lvl_pos[:, current_tokens_length:current_tokens_length + next_pn**2]
+                    pos_embed = pos_embed.to(device)
+                    
                     next_token_map = (
-                        self.draft_model.word_embed(next_token_map) + 
-                        state.draft_lvl_pos[:, current_tokens_length:current_tokens_length + next_pn**2]
+                        self.draft_model.word_embed(next_token_map) + pos_embed
                     )
                     current_tokens = next_token_map.repeat(2, 1, 1)  # CFG doubling
+                    
+                    if verbose:
+                        print(f"[SDVAR] next_token_map device: {next_token_map.device}")
         
         # 更新state中的f_hat
         if draft_tokens:
