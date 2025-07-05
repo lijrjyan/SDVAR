@@ -173,9 +173,15 @@ class SDVARParallelV1Tester:
             # 需要导入torch来创建tensor
             import torch
             
+            # 🔧 修复：根据B动态生成label_B
+            if B == 1:
+                label_B = torch.tensor([980])
+            else:
+                label_B = torch.tensor([980, 437][:B])  # 确保长度匹配B
+            
             # 初始化状态
             state = self.sdvar_model._initialize_inference_state(
-                B=B, label_B=torch.tensor([980, 437]), g_seed=42, cfg=1.5, gamma=gamma
+                B=B, label_B=label_B, g_seed=42, cfg=1.5, gamma=gamma
             )
             
             # 调用draft生成
@@ -215,9 +221,15 @@ class SDVARParallelV1Tester:
                 
             import torch
             
+            # 🔧 修复：根据B动态生成label_B
+            if B == 1:
+                label_B = torch.tensor([980])
+            else:
+                label_B = torch.tensor([980, 437][:B])  # 确保长度匹配B
+            
             # 创建模拟的draft tokens
             state = self.sdvar_model._initialize_inference_state(
-                B=B, label_B=torch.tensor([980, 437]), g_seed=42, cfg=1.5, gamma=gamma
+                B=B, label_B=label_B, g_seed=42, cfg=1.5, gamma=gamma
             )
             
             # 生成测试用的draft tokens
@@ -283,14 +295,25 @@ class SDVARParallelV1Tester:
                 
             import torch
             
+            # 🔧 修复：根据B动态生成label_B
+            if B == 1:
+                label_B = torch.tensor([980])
+            else:
+                label_B = torch.tensor([980, 437][:B])  # 确保长度匹配B
+            
             # 创建模拟数据
             state = self.sdvar_model._initialize_inference_state(
-                B=B, label_B=torch.tensor([980, 437]), g_seed=42, cfg=1.5, gamma=gamma
+                B=B, label_B=label_B, g_seed=42, cfg=1.5, gamma=gamma
             )
             
             # 模拟draft tokens
             draft_tokens = []
             total_tokens = 0
+            
+            # 如果是第一阶段，需要包含first_token_map
+            if state.current_stage == 0:
+                total_tokens += 1  # first_token_map
+            
             for i in range(gamma):
                 stage_idx = state.current_stage + i
                 if stage_idx >= len(state.patch_nums):
@@ -344,9 +367,15 @@ class SDVARParallelV1Tester:
                 
             import torch
             
+            # 🔧 修复：根据B动态生成label_B
+            if B == 1:
+                label_B = torch.tensor([980])
+            else:
+                label_B = torch.tensor([980, 437][:B])  # 确保长度匹配B
+            
             # 创建模拟数据
             state = self.sdvar_model._initialize_inference_state(
-                B=B, label_B=torch.tensor([980, 437]), g_seed=42, cfg=1.5, gamma=gamma
+                B=B, label_B=label_B, g_seed=42, cfg=1.5, gamma=gamma
             )
             
             # 模拟perfect matching场景
@@ -370,15 +399,15 @@ class SDVARParallelV1Tester:
                 target_logits.append(stage_logits)
             
             # 调用函数
-            accept_length = self.sdvar_model.basic_token_matching(
+            accepted_stages = self.sdvar_model.basic_token_matching(
                 draft_tokens, target_logits, state, B, similarity_threshold=0.5, verbose=False
             )
             
             # 验证结果
             checks = {
-                "返回整数": isinstance(accept_length, int),
-                "范围正确": 0 <= accept_length <= len(draft_tokens),
-                "完美匹配": accept_length == len(draft_tokens),  # 我们设计的是完美匹配
+                "返回整数": isinstance(accepted_stages, int),
+                "匹配成功": accepted_stages == len(draft_tokens),  # 完美匹配应该全部接受
+                "范围正确": 0 <= accepted_stages <= len(draft_tokens),
             }
             
             failed_checks = [k for k, v in checks.items() if not v]
@@ -386,7 +415,7 @@ class SDVARParallelV1Tester:
             if failed_checks:
                 return False, f"检查失败: {failed_checks}", checks
             else:
-                return True, f"匹配成功 {accept_length}/{len(draft_tokens)} stages", checks
+                return True, f"匹配成功 {accepted_stages}/{len(draft_tokens)} stages", checks
                 
         except Exception as e:
             return False, f"匹配异常: {str(e)}", {}
