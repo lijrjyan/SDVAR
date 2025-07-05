@@ -131,15 +131,92 @@ class VAR(nn.Module):
         more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
-        only used for inference, on autoregressive mode
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+        VAR自回归推理的详细tensor变化流程分析：
+        
+        === 参数初始化阶段 ===
+        - B: batch size (int)
+        - label_B: (B,) -> class labels for each sample
+        - cfg: Classifier-Free Guidance scale (float)
+        
+        === 嵌入层处理 ===
+        Step 1: 标签处理和CFG准备
+        - label_B: (B,) -> concat -> (2*B,) [B个真实标签 + B个无条件标签]
+        - class_emb(label_B): (2*B,) -> (2*B, C) [C=embed_dim]
+        - sos = cond_BD: (2*B, C) [用于条件生成的start-of-sequence embedding]
+        
+        Step 2: 位置编码预计算
+        - lvl_1L: (1, L) [L=总token数 = sum(pn^2 for pn in patch_nums)]
+        - lvl_embed(lvl_1L): (1, L) -> (1, L, C)
+        - pos_1LC: (1, L, C) [预计算的位置编码]
+        - lvl_pos = lvl_embed + pos_1LC: (1, L, C)
+        
+        === 多尺度自回归生成 ===
+        patch_nums = (1, 2, 3, 4, 5, 6, 8, 10, 13, 16) [10个尺度]
+        对于每个尺度 si, pn = patch_nums[si]:
+        
+        Step 3a: 输入token map构建 (si==0时，首层特殊处理)
+        if si == 0:
+            - sos.unsqueeze(1): (2*B, C) -> (2*B, 1, C)
+            - expand to first_l: (2*B, 1, C) -> (2*B, first_l, C) [first_l=1]
+            - pos_start: (1, first_l, C) -> broadcast -> (2*B, first_l, C)
+            - lvl_pos[:, :first_l]: (1, first_l, C) -> (2*B, first_l, C)
+            - input_token_map = sos_expanded + pos_start + lvl_pos: (2*B, first_l, C)
+        
+        Step 3b: 输入token map构建 (si>0时，基于上一层结果)
+        else:
+            - next_token_map: (B, Cvae, H_prev, W_prev) [上一层的VAE feature map]
+            - view+transpose: (B, Cvae, H_prev*W_prev) -> (B, H_prev*W_prev, Cvae)
+            - word_embed: (B, H_prev*W_prev, Cvae) -> (B, H_prev*W_prev, C)
+            - 添加当前层位置编码: + lvl_pos[:, cur_L:cur_L+pn*pn] 
+            - CFG doubling: (B, pn*pn, C) -> (2*B, pn*pn, C)
+            - input_token_map: (2*B, pn*pn, C)
+        
+        Step 4: Transformer前向传播
+        - x = input_token_map: (2*B, current_tokens, C)
+        - 通过所有transformer blocks: x -> x (形状不变)
+        - get_logits: (2*B, current_tokens, C) -> (2*B, current_tokens, V) [V=4096]
+        
+        Step 5: CFG处理和采样
+        - logits[:B]: (B, current_tokens, V) [条件logits]
+        - logits[B:]: (B, current_tokens, V) [无条件logits]
+        - CFG fusion: (1+t)*cond_logits - t*uncond_logits: (B, current_tokens, V)
+        - sampling: (B, current_tokens, V) -> (B, current_tokens) [token indices]
+        
+        Step 6: Token到VAE embedding转换
+        - vae_embedding(token_id): (B, current_tokens) -> (B, current_tokens, Cvae)
+        - transpose+reshape: (B, current_tokens, Cvae) -> (B, Cvae, pn, pn)
+        - h_BChw: (B, Cvae, pn, pn) [当前层的VAE特征图]
+        
+        Step 7: 累积特征图更新
+        - get_next_autoregressive_input: 
+          Input: f_hat(B, Cvae, 16, 16) + h_BChw(B, Cvae, pn, pn)
+          Output: new_f_hat(B, Cvae, 16, 16) + next_token_map(B, Cvae, ?, ?)
+        
+        === 各尺度的token数变化 ===
+        - Scale 0 (pn=1):  1^2  = 1    token,   cumulative: 1
+        - Scale 1 (pn=2):  2^2  = 4    tokens,  cumulative: 5  
+        - Scale 2 (pn=3):  3^2  = 9    tokens,  cumulative: 14
+        - Scale 3 (pn=4):  4^2  = 16   tokens,  cumulative: 30
+        - Scale 4 (pn=5):  5^2  = 25   tokens,  cumulative: 55
+        - Scale 5 (pn=6):  6^2  = 36   tokens,  cumulative: 91
+        - Scale 6 (pn=8):  8^2  = 64   tokens,  cumulative: 155
+        - Scale 7 (pn=10): 10^2 = 100  tokens,  cumulative: 255
+        - Scale 8 (pn=13): 13^2 = 169  tokens,  cumulative: 424
+        - Scale 9 (pn=16): 16^2 = 256  tokens,  cumulative: 680
+        
+        === 关键维度约定 ===
+        - B: batch size
+        - C: model embedding dim (1024)
+        - Cvae: VAE embedding dim (32)
+        - V: vocabulary size (4096)
+        - L: total sequence length (680)
+        - pn: patch number for current scale
+        - cur_L: cumulative tokens up to current scale
+        
+        === 最终输出 ===
+        - f_hat: (B, Cvae, 16, 16) [完整的VAE特征图]
+        - vae_proxy.fhat_to_img: (B, Cvae, 16, 16) -> (B, 3, 256, 256) [重建图像]
+        - normalize to [0,1]: (B, 3, 256, 256)
         """
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
@@ -615,17 +692,90 @@ class SDVAR(nn.Module):
         sd_mask: int = 0
     ) -> torch.Tensor:
         """
-        only used for inference, on autoregressive mode
-        :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :param entry_num: 转换模型的节点
-        :param sd_mask: 是否使用我们自己写的block_wise的掩码
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+        SDVAR推测解码test3版本 - 多种掩码策略的对比测试
+        
+        === 核心设计思想 ===
+        这个函数实现了混合模型推测解码：
+        1. Draft模型(更快)：生成前entry_num层的tokens
+        2. Target模型(更精确)：生成剩余层的tokens
+        3. 使用不同的注意力掩码策略控制信息流
+        
+        === 参数说明 ===
+        :param entry_num: 转换点，0-9对应VAR的10个尺度
+                         - 0: target模型生成所有层 (无推测解码)
+                         - 5: draft生成前5层，target生成后5层 (平衡)
+                         - 9: draft生成前9层，target只生成最后1层 (激进推测)
+        
+        :param sd_mask: 掩码策略选择 (0-5)
+                       控制target模型在验证draft tokens时的注意力模式
+        
+        === 掩码类型详细分析 ===
+        
+        **sd_mask = 0: 无特殊掩码**
+        - 使用标准的因果掩码 (attn_bias=None)
+        - target模型可以看到所有之前的tokens
+        - 最简单的策略，但可能引入不一致性
+        
+        **sd_mask = 1: SD掩码 - 包括当前层**
+        - 使用 self.attn_bias_for_sdmasking
+        - 特点：允许同block内的tokens互相看见，禁止跨block
+        - 包括当前正在生成的层 (sindex:pindex全部可见)
+        - 适用于需要保持spatial locality的场景
+        
+        **sd_mask = 2: SD掩码 - 排除当前层**  
+        - 基于sd_mask=1，但当前生成层不能互相看见
+        - attn_bias[:, :, sindex:pindex, :] = 0.0
+        - 更严格的因果性约束，避免future leakage
+        - 推荐用于生产环境的推测解码
+        
+        **sd_mask = 3: 标准因果掩码**
+        - 使用VAR原生的 self.target_model.attn_bias_for_masking
+        - 严格的左上三角掩码：只能看到位置靠前的tokens
+        - 保证与单独使用target模型的结果一致
+        
+        **sd_mask = 4: Block掩码 - 包括当前层**
+        - 使用 self.attn_bias_for_block
+        - 只允许相同block_id的tokens互相注意
+        - 最强的spatial constraint，保持VAR的multi-scale特性
+        
+        **sd_mask = 5: Block掩码 - 排除当前层**
+        - 基于sd_mask=4，当前层内部无注意力
+        - 结合了block constraint和因果性
+        - 最保守的策略，质量最有保证
+        
+        === Tensor变化流程 (以entry_num=5为例) ===
+        
+        **Draft阶段 (si=0到4):**
+        - Scale 0: (B, 1, 1024) -> draft模型 -> tokens(B, 1)
+        - Scale 1: (B, 4, 1024) -> draft模型 -> tokens(B, 4)  
+        - Scale 2: (B, 9, 1024) -> draft模型 -> tokens(B, 9)
+        - Scale 3: (B, 16, 1024) -> draft模型 -> tokens(B, 16)
+        - Scale 4: (B, 25, 1024) -> draft模型 -> tokens(B, 25)
+        - draft_token_hub: 拼接所有draft tokens -> (B, 55, 32)
+        
+        **Target阶段 (si=5到9):**
+        - 输入：draft_token_hub(B, 55, 32) + target_first_token_map(2B, 1, 1024)
+        - word_embed: (B, 55, 32) -> (B, 55, 1024)
+        - 位置编码: + target_lvl_pos[:, 1:56] -> (B, 55, 1024)
+        - CFG doubling: (B, 55, 1024) -> (2B, 55, 1024)
+        - 拼接: target_first_token_map + target_next_token_map -> (2B, 56, 1024)
+        
+        **掩码应用:**
+        - pindex = exit_points[5] = 91 (cumulative tokens up to scale 5)
+        - sindex = start_points[5] = 55 (tokens in scale 5)
+        - 掩码形状: (1, 1, 91, 91) 控制91个tokens间的注意力
+        
+        === 性能特征 ===
+        - Draft模型调用次数: entry_num次  
+        - Target模型调用次数: (10 - entry_num)次
+        - 理论加速比: draft_latency / target_latency * entry_num/10
+        - 质量损失: 取决于draft/target模型差异和掩码策略
+        
+        === 建议使用策略 ===
+        - 高质量优先: entry_num=2, sd_mask=5
+        - 平衡模式: entry_num=5, sd_mask=2  
+        - 高速度优先: entry_num=8, sd_mask=1
+        - Debug模式: entry_num=5, sd_mask=3 (与原始VAR对比)
         """
         ###### 通用参数参数
         assert self.draft_model.patch_nums == self.target_model.patch_nums
@@ -1104,24 +1254,25 @@ class SDVAR(nn.Module):
             
             print(f"[SDVAR] Processing stage {current_stage}, tokens shape: {tokens.shape}, pn={pn}")
             
-            # 处理draft tokens - 所有阶段都使用相同的处理方式
-            # 获取VAE embedding
-            h_BChw = self.target_model.vae_quant_proxy[0].embedding(tokens)  # (B, pn*pn, Cvae)
-            h_BChw = h_BChw.transpose(1, 2).reshape(B, self.target_model.Cvae, pn, pn)  # (B, Cvae, pn, pn)
+            # 简化的处理方式：直接从VAE embedding到word_embed
+            # 避免复杂的tensor变换，直接使用VAE embedding的输出
+            vae_embedding = self.target_model.vae_quant_proxy[0].embedding(tokens)  # (B, pn*pn, Cvae)
+            print(f"[SDVAR] VAE embedding shape: {vae_embedding.shape}")
             
-            # 转换为word_embed的输入格式
-            h_embed_input = h_BChw.view(B, self.target_model.Cvae, -1).transpose(1, 2)  # (B, pn*pn, Cvae)
+            # 直接将VAE embedding传给word_embed
+            # word_embed期望输入格式为(B, L, Cvae)
+            stage_embedding = self.target_model.word_embed(vae_embedding)  # (B, pn*pn, C)
+            print(f"[SDVAR] After word_embed shape: {stage_embedding.shape}")
             
             # 添加位置编码 - 确保维度匹配
             pos_embed = state.target_lvl_pos[:1, current_pos:current_pos + pn * pn].expand(B, -1, -1)
+            print(f"[SDVAR] pos_embed shape: {pos_embed.shape}")
             
-            print(f"[SDVAR] h_embed_input shape: {h_embed_input.shape}, pos_embed shape: {pos_embed.shape}")
+            # 应用位置编码
+            stage_embedding = stage_embedding + pos_embed
+            all_embeddings.append(stage_embedding)
             
-            # 应用word embedding和位置编码
-            h_embed = self.target_model.word_embed(h_embed_input) + pos_embed
-            all_embeddings.append(h_embed)
-            
-            print(f"[SDVAR] Stage {current_stage} embedding shape: {h_embed.shape}")
+            print(f"[SDVAR] Stage {current_stage} final embedding shape: {stage_embedding.shape}")
             
             current_pos += pn * pn
         

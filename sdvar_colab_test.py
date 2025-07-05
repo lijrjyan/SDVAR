@@ -182,8 +182,81 @@ print(f"   VAE: {sum(p.numel() for p in vae.parameters())/1e6:.1f}M parameters")
 print(f"   Draft VAR: {sum(p.numel() for p in draft_var.parameters())/1e6:.1f}M parameters")
 print(f"   Target VAR: {sum(p.numel() for p in target_var.parameters())/1e6:.1f}M parameters")
 
-# ===================== CELL 6: 最新SDVAR并行验证框架测试 =====================
-print("🚀 Testing Latest SDVAR Parallel Verification Framework")
+# ===================== CELL 6: SDVAR核心函数基础测试 =====================
+print("🧪 SDVAR Core Function Basic Test")
+print("=" * 60)
+
+def test_sdvar_core_function():
+    """测试SDVAR核心函数是否能正常运行"""
+    print("🎯 目标：验证 sdvar_autoregressive_infer_cfg_parallel_v1 核心函数")
+    
+    # 使用最小参数进行测试
+    B_test = 2  # 小batch size加快测试
+    test_labels = [980, 437]  # volcano, beach_wagon
+    label_B_test = torch.tensor(test_labels, device=device)
+    
+    print(f"📊 测试配置:")
+    print(f"   Batch size: {B_test}")
+    print(f"   Test classes: {test_labels}")
+    print(f"   Gamma: 2")
+    print(f"   CFG: {cfg}")
+    
+    try:
+        print("\n🚀 开始核心函数测试...")
+        start_time = time.time()
+        
+        # 测试核心函数
+        result_images = sd_var.sdvar_autoregressive_infer_cfg_parallel_v1(
+            B=B_test,
+            label_B=label_B_test,
+            g_seed=seed,
+            cfg=cfg,
+            gamma=2,
+            top_k=top_k,
+            top_p=top_p,
+            similarity_threshold=0.7,
+            max_retries=3,
+            verbose=True
+        )
+        
+        end_time = time.time()
+        generation_time = end_time - start_time
+        
+        print(f"\n✅ 核心函数测试成功!")
+        print(f"⏱️ 生成时间: {generation_time:.2f}s")
+        print(f"📏 输出形状: {result_images.shape}")
+        print(f"🎯 每张图片耗时: {generation_time/B_test:.2f}s")
+        
+        # 显示生成的图片
+        print(f"\n🖼️ 生成结果:")
+        chw = torchvision.utils.make_grid(result_images, nrow=B_test, padding=2, pad_value=1.0)
+        chw = chw.permute(1, 2, 0).mul_(255).cpu().numpy()
+        chw = PImage.fromarray(chw.astype(np.uint8))
+        display(chw)
+        
+        print(f"🎉 核心函数运行正常，可以进行更复杂的测试！")
+        return True, generation_time
+        
+    except Exception as e:
+        print(f"\n❌ 核心函数测试失败: {str(e)}")
+        print(f"🔧 需要修复问题才能继续")
+        import traceback
+        traceback.print_exc()
+        return False, None
+
+# 执行核心函数测试
+print("=" * 40)
+core_success, core_time = test_sdvar_core_function()
+print("=" * 40)
+
+if core_success:
+    print(f"✅ 核心测试通过! 耗时: {core_time:.2f}s")
+    print("🎯 现在可以进行完整的功能测试")
+else:
+    print("❌ 核心测试失败! 请修复问题后再继续")
+
+# ===================== CELL 7: 最新SDVAR并行验证框架测试 =====================
+print("\n🚀 Testing Latest SDVAR Parallel Verification Framework")
 print("=" * 60)
 
 def test_sdvar_parallel_verification(gamma=2, similarity_thresh=0.7, test_name="Parallel Verification"):
@@ -259,7 +332,7 @@ print(f"\n📈 Gamma Performance Summary:")
 for gamma, time_taken in gamma_results.items():
     print(f"   γ={gamma}: {time_taken:.2f}s")
 
-# ===================== CELL 7: 并行验证性能对比测试 =====================
+# ===================== CELL 8: 并行验证性能对比测试 =====================
 print("\n" + "=" * 60)
 print("⚡ Performance Comparison: Sequential vs Parallel")
 print("=" * 60)
@@ -330,7 +403,7 @@ def performance_comparison_test():
 
 perf_results, speedup = performance_comparison_test()
 
-# ===================== CELL 8: 质量验证测试 =====================
+# ===================== CELL 9: 质量验证测试 =====================
 print("\n" + "=" * 60)
 print("🎨 Image Quality Validation")
 print("=" * 60)
@@ -397,7 +470,7 @@ def quality_validation_test():
 
 baseline_imgs, sdvar_imgs, mse_diff = quality_validation_test()
 
-# ===================== CELL 9: 详细性能分析 =====================
+# ===================== CELL 10: 详细性能分析 =====================
 print("\n" + "=" * 60)
 print("📈 Detailed Performance Analysis")
 print("=" * 60)
@@ -466,7 +539,7 @@ def detailed_performance_analysis():
 
 detailed_results = detailed_performance_analysis()
 
-# ===================== CELL 10: 总结报告 =====================
+# ===================== CELL 11: 总结报告 =====================
 print("\n" + "=" * 60)
 print("📋 SDVAR Enhanced Testing Summary Report")
 print("=" * 60)
@@ -511,7 +584,7 @@ def generate_summary_report():
 
 generate_summary_report()
 
-# ===================== CELL 11: 交互式测试面板 =====================
+# ===================== CELL 12: 交互式测试面板 =====================
 print("\n" + "=" * 60)  
 print("🎮 Interactive Testing Panel")
 print("=" * 60)
