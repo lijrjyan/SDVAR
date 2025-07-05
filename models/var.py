@@ -946,13 +946,14 @@ class SDVAR(nn.Module):
         
         return state
     
-    def draft_generate_batch(self, state, B: int) -> List[torch.Tensor]:
+    def draft_generate_batch(self, state, B: int, verbose: bool = False) -> List[torch.Tensor]:
         """draft模型批量生成gamma层"""
         gamma = min(state.gamma, state.total_stages - state.current_stage)
         if gamma <= 0:
             return []
         
-        print(f"[SDVAR] Draft generating batch: gamma={gamma}, current_stage={state.current_stage}")
+        if verbose:
+            print(f"[SDVAR] Draft generating batch: gamma={gamma}, current_stage={state.current_stage}")
         
         # 确保KV cache开启
         for blk in self.draft_model.blocks:
@@ -966,7 +967,8 @@ class SDVAR(nn.Module):
             stage_idx = state.current_stage + gamma_step
             pn = state.patch_nums[stage_idx]
             
-            print(f"[SDVAR] Draft stage {stage_idx}, pn={pn}, tokens_shape={current_tokens.shape}")
+            if verbose:
+                print(f"[SDVAR] Draft stage {stage_idx}, pn={pn}, tokens_shape={current_tokens.shape}")
             
             # 前向计算
             x = current_tokens
@@ -1158,7 +1160,8 @@ class SDVAR(nn.Module):
         return mask.unsqueeze(0).unsqueeze(0)  # 添加batch和head维度
 
     def basic_token_matching(self, draft_tokens: List[torch.Tensor], 
-                           target_logits: List[torch.Tensor], state, B: int) -> int:
+                           target_logits: List[torch.Tensor], state, B: int, 
+                           similarity_threshold: float = 0.5, verbose: bool = False) -> int:
         """
         基础token匹配验证逻辑 - Week 1简化版本
         
@@ -1179,7 +1182,8 @@ class SDVAR(nn.Module):
             return 0
         
         gamma = len(draft_tokens)
-        print(f"[SDVAR] Starting basic token matching for {gamma} stages")
+        if verbose:
+            print(f"[SDVAR] Starting basic token matching for {gamma} stages")
         
         accepted_stages = 0
         total_tokens = 0
@@ -1193,7 +1197,8 @@ class SDVAR(nn.Module):
             draft_stage_tokens = draft_tokens[stage_idx]  # B, pn*pn
             target_stage_logits = target_logits[stage_idx]  # B, pn*pn, V
             
-            print(f"[SDVAR] Matching stage {current_stage}: draft_tokens shape {draft_stage_tokens.shape}, target_logits shape {target_stage_logits.shape}")
+            if verbose:
+                print(f"[SDVAR] Matching stage {current_stage}: draft_tokens shape {draft_stage_tokens.shape}, target_logits shape {target_stage_logits.shape}")
             
             # 获取target的top-1预测
             target_top1 = torch.argmax(target_stage_logits, dim=-1)  # B, pn*pn
@@ -1208,21 +1213,25 @@ class SDVAR(nn.Module):
             total_tokens += stage_total
             matched_tokens += stage_matched
             
-            print(f"[SDVAR] Stage {current_stage} match rate: {stage_match_rate:.3f} ({stage_matched}/{stage_total})")
+            if verbose:
+                print(f"[SDVAR] Stage {current_stage} match rate: {stage_match_rate:.3f} ({stage_matched}/{stage_total})")
             
             # 基础匹配策略：如果匹配率 >= 阈值，接受这一层
             # Week 1使用简单的层级匹配阈值
-            match_threshold = 0.5  # 50%匹配率阈值
+            match_threshold = similarity_threshold  # 使用传入的相似度阈值
             
             if stage_match_rate >= match_threshold:
                 accepted_stages += 1
-                print(f"[SDVAR] ✅ Accepting stage {current_stage} (match rate: {stage_match_rate:.3f})")
+                if verbose:
+                    print(f"[SDVAR] ✅ Accepting stage {current_stage} (match rate: {stage_match_rate:.3f})")
             else:
-                print(f"[SDVAR] ❌ Rejecting stage {current_stage} and all subsequent stages (match rate: {stage_match_rate:.3f})")
+                if verbose:
+                    print(f"[SDVAR] ❌ Rejecting stage {current_stage} and all subsequent stages (match rate: {stage_match_rate:.3f})")
                 break  # 一旦有层被拒绝，后续层也全部拒绝（保持因果性）
         
         overall_match_rate = matched_tokens / total_tokens if total_tokens > 0 else 0.0
-        print(f"[SDVAR] Basic matching completed: accepted {accepted_stages}/{gamma} stages, overall match rate: {overall_match_rate:.3f}")
+        if verbose:
+            print(f"[SDVAR] Basic matching completed: accepted {accepted_stages}/{gamma} stages, overall match rate: {overall_match_rate:.3f}")
         
         return accepted_stages
 
@@ -1285,7 +1294,8 @@ class SDVAR(nn.Module):
     def sdvar_autoregressive_infer_cfg_parallel_v1(
         self, B: int, label_B: Optional[Union[int, torch.LongTensor]] = None,
         g_seed: Optional[int] = None, cfg: float = 1.5,
-        gamma: int = 2, top_k: int = 0, top_p: float = 0.0, more_smooth: bool = False
+        gamma: int = 2, top_k: int = 0, top_p: float = 0.0, more_smooth: bool = False,
+        similarity_threshold: float = 0.5, max_retries: int = 3, verbose: bool = False
     ) -> torch.Tensor:
         """
         SDVAR并行推理 v1.0 - 固定gamma版本
@@ -1304,9 +1314,13 @@ class SDVAR(nn.Module):
         :param top_k: top-k sampling
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax
+        :param similarity_threshold: token匹配的相似度阈值
+        :param max_retries: 最大重试次数
+        :param verbose: 是否输出详细信息
         :return: reconstructed image (B, 3, H, W) in [0, 1]
         """
-        print(f"[SDVAR] Starting parallel inference v1.0 with gamma={gamma}")
+        if verbose:
+            print(f"[SDVAR] Starting parallel inference v1.0 with gamma={gamma}")
         
         # 初始化状态
         state = self._initialize_inference_state(B, label_B, g_seed, cfg, gamma)
@@ -1315,35 +1329,43 @@ class SDVAR(nn.Module):
         state.more_smooth = more_smooth
         
         # 主推理循环 - 这里是关键改进：while循环代替for循环
-        while state.current_stage < state.total_stages:
-            print(f"[SDVAR] === Processing stages {state.current_stage} to {min(state.current_stage + gamma - 1, state.total_stages - 1)} ===")
+        retry_count = 0
+        while state.current_stage < state.total_stages and retry_count < max_retries:
+            if verbose:
+                print(f"[SDVAR] === Processing stages {state.current_stage} to {min(state.current_stage + gamma - 1, state.total_stages - 1)} ===")
             
             # 1. Draft批量生成
-            draft_tokens = self.draft_generate_batch(state, B)
+            draft_tokens = self.draft_generate_batch(state, B, verbose)
             if not draft_tokens:
-                print("[SDVAR] No more tokens to generate, breaking")
+                if verbose:
+                    print("[SDVAR] No more tokens to generate, breaking")
                 break
             
             actual_gamma = len(draft_tokens)
-            print(f"[SDVAR] Draft generated {actual_gamma} stages")
+            if verbose:
+                print(f"[SDVAR] Draft generated {actual_gamma} stages")
             
             # 2. Target批量验证 (Week 1新增功能)
             target_logits, verified_gamma = self.target_verify_batch(draft_tokens, state, B)
             
             # 3. 基础匹配验证 - 集成真正的token匹配逻辑
             if target_logits and len(target_logits) > 0:
-                accept_length = self.basic_token_matching(draft_tokens, target_logits, state, B)
-                print(f"[SDVAR] Token matching result: accepting {accept_length}/{verified_gamma} stages")
+                accept_length = self.basic_token_matching(draft_tokens, target_logits, state, B, similarity_threshold, verbose)
+                if verbose:
+                    print(f"[SDVAR] Token matching result: accepting {accept_length}/{verified_gamma} stages")
             else:
                 accept_length = 0
-                print(f"[SDVAR] Target verification failed, rejecting all")
+                if verbose:
+                    print(f"[SDVAR] Target verification failed, rejecting all")
             
             # 4. 更新推理状态
             if accept_length > 0:
                 self.update_state_with_accepted_tokens(draft_tokens, accept_length, state, B)
-                print(f"[SDVAR] Successfully processed {accept_length} stages")
+                if verbose:
+                    print(f"[SDVAR] Successfully processed {accept_length} stages")
             else:
-                print(f"[SDVAR] No stages accepted, will retry with smaller gamma")
+                if verbose:
+                    print(f"[SDVAR] No stages accepted, will retry with smaller gamma")
             
             # 5. 提交接受的部分
             state.accept_count += accept_length
@@ -1354,21 +1376,27 @@ class SDVAR(nn.Module):
                 # 如果没有接受任何stage，降低gamma重试
                 if state.gamma > 1:
                     state.gamma = max(1, state.gamma - 1)
-                    print(f"[SDVAR] Reducing gamma to {state.gamma} due to rejection")
+                    if verbose:
+                        print(f"[SDVAR] Reducing gamma to {state.gamma} due to rejection")
                 else:
                     # gamma=1还是失败，强制接受一层避免死循环
-                    print(f"[SDVAR] Emergency fallback: force accepting 1 stage at {state.current_stage}")
+                    if verbose:
+                        print(f"[SDVAR] Emergency fallback: force accepting 1 stage at {state.current_stage}")
                     if draft_tokens:
                         self.update_state_with_accepted_tokens(draft_tokens[:1], 1, state, B)
                         state.accept_count += 1
                         state.current_stage += 1
+                retry_count += 1
             elif accept_length == verified_gamma:
                 # 如果全部接受，可以考虑增加gamma（但Week 1保持固定）
-                print(f"[SDVAR] All stages accepted, maintaining gamma={state.gamma}")
+                if verbose:
+                    print(f"[SDVAR] All stages accepted, maintaining gamma={state.gamma}")
+                retry_count = 0  # 重置重试计数器
             
             # 7. 检查是否有进展
             if accept_length == 0 and state.gamma == 1:
-                print(f"[SDVAR] No progress possible, stopping inference")
+                if verbose:
+                    print(f"[SDVAR] No progress possible, stopping inference")
                 break
 
         # 清理KV cache
@@ -1377,7 +1405,8 @@ class SDVAR(nn.Module):
         for blk in self.target_model.blocks:
             blk.attn.kv_caching(False)
         
-        print(f"[SDVAR] Inference completed. Accepted: {state.accept_count}, Target calls: {state.target_calls}")
+        if verbose:
+            print(f"[SDVAR] Inference completed. Accepted: {state.accept_count}, Target calls: {state.target_calls}")
         
         # 返回最终图像
         return self.draft_model.vae_proxy[0].fhat_to_img(state.draft_f_hat).add_(1).mul_(0.5)
