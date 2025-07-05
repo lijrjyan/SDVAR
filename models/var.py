@@ -1198,17 +1198,17 @@ class SDVAR(nn.Module):
                     if verbose:
                         print(f"[SDVAR] next_token_map device: {next_token_map.device}")
         
-        # 更新state中的f_hat
-        if draft_tokens:
-            # 处理最后一个stage的f_hat更新
-            final_stage_idx = state.current_stage + len(draft_tokens) - 1
-            final_pn = state.patch_nums[final_stage_idx]
-            final_h_BChw = self.draft_model.vae_quant_proxy[0].embedding(draft_tokens[-1])
-            final_h_BChw = final_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, final_pn, final_pn)
-            
-            state.draft_f_hat, _ = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
-                final_stage_idx, state.total_stages, current_f_hat, final_h_BChw
-            )
+        # 更新state中的f_hat - 注释掉避免双重更新
+        # if draft_tokens:
+        #     # 处理最后一个stage的f_hat更新
+        #     final_stage_idx = state.current_stage + len(draft_tokens) - 1
+        #     final_pn = state.patch_nums[final_stage_idx]
+        #     final_h_BChw = self.draft_model.vae_quant_proxy[0].embedding(draft_tokens[-1])
+        #     final_h_BChw = final_h_BChw.transpose(1, 2).reshape(B, self.draft_model.Cvae, final_pn, final_pn)
+        #     
+        #     state.draft_f_hat, _ = self.draft_model.vae_quant_proxy[0].get_next_autoregressive_input(
+        #         final_stage_idx, state.total_stages, current_f_hat, final_h_BChw
+        #     )
         
         return draft_tokens
 
